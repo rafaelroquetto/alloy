@@ -5,23 +5,14 @@ package beyla
 import (
 	"bytes"
 	"context"
-	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/grafana/beyla/v2/pkg/beyla"
-	"github.com/grafana/beyla/v2/pkg/config"
-	beylaSvc "github.com/grafana/beyla/v2/pkg/services"
 	"github.com/stretchr/testify/require"
-	"go.opentelemetry.io/obi/pkg/export/attributes"
-	"go.opentelemetry.io/obi/pkg/export/debug"
-	"go.opentelemetry.io/obi/pkg/export/instrumentations"
-	"go.opentelemetry.io/obi/pkg/filter"
-	"go.opentelemetry.io/obi/pkg/kubeflags"
-	"go.opentelemetry.io/obi/pkg/services"
-	"go.opentelemetry.io/obi/pkg/transform"
+	"gopkg.in/yaml.v3"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
@@ -145,800 +136,218 @@ func TestArguments_UnmarshalSyntax(t *testing.T) {
 	`
 	var args Arguments
 	require.NoError(t, syntax.Unmarshal([]byte(in), &args))
-	cfg, err := args.Convert()
-	require.NoError(t, err)
 
-	require.Equal(t, transform.UnmatchType("wildcard"), cfg.Routes.Unmatch)
-	require.Equal(t, []string{"/api/v1/*"}, cfg.Routes.Patterns)
-	require.Equal(t, []string{"/api/v1/health"}, cfg.Routes.IgnorePatterns)
-	require.Equal(t, transform.IgnoreMode("all"), cfg.Routes.IgnoredEvents)
-	require.Equal(t, "*", cfg.Routes.WildcardChar)
+	// Verify routes
+	require.Equal(t, "wildcard", args.Routes.Unmatch)
+	require.Equal(t, []string{"/api/v1/*"}, args.Routes.Patterns)
+	require.Equal(t, []string{"/api/v1/health"}, args.Routes.IgnorePatterns)
+	require.Equal(t, "all", args.Routes.IgnoredEvents)
+	require.Equal(t, "*", args.Routes.WildcardChar)
 
-	require.Equal(t, kubeflags.EnabledTrue, cfg.Attributes.Kubernetes.Enable)
-	require.Equal(t, 15*time.Second, cfg.Attributes.Kubernetes.InformersSyncTimeout)
-	require.Equal(t, 30*time.Minute, cfg.Attributes.Kubernetes.InformersResyncPeriod)
-	require.Equal(t, "test", cfg.Attributes.Kubernetes.ClusterName)
-	require.Equal(t, []string{"node"}, cfg.Attributes.Kubernetes.DisableInformers)
-	require.True(t, cfg.Attributes.Kubernetes.MetaRestrictLocalNode)
-	require.Equal(t, "localhost:9090", cfg.Attributes.Kubernetes.MetaCacheAddress)
-	require.Len(t, cfg.Attributes.Select, 1)
-	sel, ok := cfg.Attributes.Select["sql_client_duration"]
-	require.True(t, ok)
-	require.Equal(t, []string{"*"}, sel.Include)
-	require.Equal(t, []string{"db_statement"}, sel.Exclude)
+	// Verify kubernetes attributes
+	require.Equal(t, "true", args.Attributes.Kubernetes.Enable)
+	require.Equal(t, 15*time.Second, args.Attributes.Kubernetes.InformersSyncTimeout)
+	require.Equal(t, 30*time.Minute, args.Attributes.Kubernetes.InformersResyncPeriod)
+	require.Equal(t, "test", args.Attributes.Kubernetes.ClusterName)
+	require.Equal(t, []string{"node"}, args.Attributes.Kubernetes.DisableInformers)
+	require.True(t, args.Attributes.Kubernetes.MetaRestrictLocalNode)
+	require.Equal(t, "localhost:9090", args.Attributes.Kubernetes.MetaCacheAddress)
 
-	require.True(t, cfg.NetworkFlows.Enable)
-	require.Equal(t, "0.0.0.0", cfg.NetworkFlows.AgentIP)
-	require.Equal(t, []string{"eth0"}, cfg.NetworkFlows.Interfaces)
-	require.Equal(t, []string{"TCP", "UDP"}, cfg.NetworkFlows.Protocols)
-	require.Equal(t, []string{"ICMP"}, cfg.NetworkFlows.ExcludeProtocols)
-	require.Equal(t, 1, cfg.NetworkFlows.Sampling)
-	require.Equal(t, "10.0.0.0/8", cfg.NetworkFlows.CIDRs[0])
-	require.Equal(t, 8000, cfg.NetworkFlows.CacheMaxFlows)
-	require.Equal(t, 10*time.Second, cfg.NetworkFlows.CacheActiveTimeout)
-	require.Equal(t, "ingress", cfg.NetworkFlows.Direction)
-	require.Equal(t, "local", cfg.NetworkFlows.AgentIPIface)
-	require.Equal(t, "ipv4", cfg.NetworkFlows.AgentIPType)
-	require.Empty(t, cfg.NetworkFlows.ExcludeInterfaces)
+	// Verify select attributes
+	require.Len(t, args.Attributes.Select, 1)
+	require.Equal(t, "sql_client_duration", args.Attributes.Select[0].Section)
+	require.Equal(t, []string{"*"}, args.Attributes.Select[0].Include)
+	require.Equal(t, []string{"db_statement"}, args.Attributes.Select[0].Exclude)
 
-	require.Len(t, cfg.Discovery.Instrument, 2)
-	require.Equal(t, "test", cfg.Discovery.Instrument[0].Name)
-	require.Equal(t, "default", cfg.Discovery.Instrument[0].Namespace)
-	require.True(t, cfg.Discovery.Instrument[0].Path.IsSet())
-	require.True(t, cfg.Discovery.Instrument[0].Metadata[services.AttrNamespace].IsSet())
-	require.True(t, cfg.Discovery.Instrument[0].ExportModes.CanExportMetrics())
-	require.True(t, cfg.Discovery.Instrument[0].ExportModes.CanExportTraces())
-	require.Equal(t, &services.SamplerConfig{Name: "traceidratio", Arg: "0.5"}, cfg.Discovery.Instrument[0].SamplerConfig)
-	require.True(t, cfg.Discovery.Instrument[1].PodLabels["test"].IsSet())
-	require.True(t, cfg.Discovery.Instrument[1].ExportModes.CanExportMetrics())
-	require.False(t, cfg.Discovery.Instrument[1].ExportModes.CanExportTraces())
+	// Verify network
+	require.Equal(t, "0.0.0.0", args.Metrics.Network.AgentIP)
+	require.Equal(t, []string{"eth0"}, args.Metrics.Network.Interfaces)
+	require.Equal(t, []string{"TCP", "UDP"}, args.Metrics.Network.Protocols)
+	require.Equal(t, []string{"ICMP"}, args.Metrics.Network.ExcludeProtocols)
+	require.Equal(t, 1, args.Metrics.Network.Sampling)
+	require.Equal(t, "10.0.0.0/8", args.Metrics.Network.CIDRs[0])
+	require.Equal(t, 8000, args.Metrics.Network.CacheMaxFlows)
+	require.Equal(t, 10*time.Second, args.Metrics.Network.CacheActiveTimeout)
+	require.Equal(t, "ingress", args.Metrics.Network.Direction)
+	require.Equal(t, "local", args.Metrics.Network.AgentIPIface)
+	require.Equal(t, "ipv4", args.Metrics.Network.AgentIPType)
+	require.Empty(t, args.Metrics.Network.ExcludeInterfaces)
 
-	require.Len(t, cfg.Discovery.ExcludeInstrument, 1)
-	require.True(t, cfg.Discovery.ExcludeInstrument[0].Path.IsSet())
-	require.Equal(t, "default", cfg.Discovery.ExcludeInstrument[0].Namespace)
+	// Verify discovery
+	require.Len(t, args.Discovery.Instrument, 2)
+	require.Equal(t, "test", args.Discovery.Instrument[0].Name)
+	require.Equal(t, "default", args.Discovery.Instrument[0].Namespace)
+	require.Equal(t, "80,443", args.Discovery.Instrument[0].OpenPorts)
+	require.Equal(t, "/usr/bin/app*", args.Discovery.Instrument[0].Path)
+	require.Equal(t, []string{"metrics", "traces"}, args.Discovery.Instrument[0].ExportModes)
+	require.Equal(t, "traceidratio", args.Discovery.Instrument[0].Sampler.Name)
+	require.Equal(t, "0.5", args.Discovery.Instrument[0].Sampler.Arg)
 
-	require.Len(t, cfg.Discovery.Survey, 1)
-	require.True(t, cfg.Discovery.Survey[0].Path.IsSet())
-	require.Equal(t, "microservice", cfg.Discovery.Survey[0].Name)
-	require.True(t, cfg.Discovery.Survey[0].ExportModes.CanExportMetrics())
-	require.True(t, cfg.Discovery.Survey[0].ExportModes.CanExportTraces())
+	require.Len(t, args.Discovery.ExcludeInstrument, 1)
+	require.Equal(t, "/usr/bin/test*", args.Discovery.ExcludeInstrument[0].Path)
+	require.Equal(t, "default", args.Discovery.ExcludeInstrument[0].Namespace)
 
-	require.Equal(t, []string{"application", "network"}, cfg.Prometheus.Features)
-	require.Equal(t, []string{"redis", "sql", "gpu", "mongo"}, cfg.Prometheus.Instrumentations)
+	require.Len(t, args.Discovery.Survey, 1)
+	require.Equal(t, "/app/microservice-*", args.Discovery.Survey[0].Path)
+	require.Equal(t, "microservice", args.Discovery.Survey[0].Name)
 
-	require.True(t, cfg.EnforceSysCaps)
-	require.Equal(t, 10, cfg.EBPF.WakeupLen)
-	require.True(t, cfg.EBPF.TrackRequestHeaders)
-	require.Equal(t, cfg.EBPF.ContextPropagation, config.ContextPropagationIPOptionsOnly)
-	require.Equal(t, 10*time.Second, cfg.EBPF.HTTPRequestTimeout)
-	require.True(t, cfg.EBPF.HighRequestVolume)
-	require.True(t, cfg.EBPF.HeuristicSQLDetect)
-	require.False(t, cfg.EBPF.BpfDebug)
-	require.False(t, cfg.EBPF.ProtocolDebug)
-	require.Len(t, cfg.Filters.Application, 1)
-	require.Len(t, cfg.Filters.Network, 1)
-	require.Equal(t, filter.MatchDefinition{NotMatch: "UDP"}, cfg.Filters.Application["transport"])
-	require.Equal(t, filter.MatchDefinition{Match: "53"}, cfg.Filters.Network["dst_port"])
-	require.Equal(t, debug.TracePrinter("json"), cfg.TracePrinter)
-	require.Equal(t, []string{"http", "grpc", "kafka"}, cfg.TracesReceiver.Instrumentations)
-	require.Equal(t, services.SamplerConfig{Name: "traceidratio", Arg: "0.1"}, cfg.TracesReceiver.Sampler)
-	require.Len(t, cfg.TracesReceiver.Traces, 0)
+	// Verify metrics
+	require.Equal(t, []string{"application", "network"}, args.Metrics.Features)
+	require.Equal(t, []string{"redis", "sql", "gpu", "mongo"}, args.Metrics.Instrumentations)
 
-	instrumentConverted, err := args.Discovery.Instrument.ConvertGlob()
-	require.NoError(t, err)
-	require.Len(t, instrumentConverted, 2)
+	// Verify eBPF
+	require.True(t, args.EnforceSysCaps)
+	require.Equal(t, 10, args.EBPF.WakeupLen)
+	require.True(t, args.EBPF.TrackRequestHeaders)
+	require.Equal(t, "ip", args.EBPF.ContextPropagation)
+	require.Equal(t, 10*time.Second, args.EBPF.HTTPRequestTimeout)
+	require.True(t, args.EBPF.HighRequestVolume)
+	require.True(t, args.EBPF.HeuristicSQLDetect)
+	require.False(t, args.EBPF.BpfDebug)
+	require.False(t, args.EBPF.ProtocolDebug)
 
-	surveyConverted, err := args.Discovery.Survey.ConvertGlob()
-	require.NoError(t, err)
-	require.Len(t, surveyConverted, 1)
+	// Verify filters
+	require.Len(t, args.Filters.Application, 1)
+	require.Len(t, args.Filters.Network, 1)
+	require.Equal(t, "transport", args.Filters.Application[0].Attr)
+	require.Equal(t, "UDP", args.Filters.Application[0].NotMatch)
+	require.Equal(t, "dst_port", args.Filters.Network[0].Attr)
+	require.Equal(t, "53", args.Filters.Network[0].Match)
 
+	// Verify trace printer
+	require.Equal(t, "json", args.TracePrinter)
+
+	// Verify traces
+	require.Equal(t, []string{"http", "grpc", "kafka"}, args.Traces.Instrumentations)
+	require.Equal(t, "traceidratio", args.Traces.Sampler.Name)
+	require.Equal(t, "0.1", args.Traces.Sampler.Arg)
+
+	// Verify validation passes
 	require.NoError(t, args.Discovery.Instrument.Validate())
 	require.NoError(t, args.Discovery.Survey.Validate())
-
-	require.True(t, len(cfg.Discovery.Instrument) > 0 || len(cfg.Discovery.Survey) > 0)
 }
 
-func TestArguments_TracePrinterDebug(t *testing.T) {
-	test := func(debugEnabled bool, printer string, expected string) {
-		const format = `
-		debug = %t
-		discovery {
-			services {
-				open_ports = "80,443"
-			}
-		}
-		metrics {
-			features = ["application", "network"]
-		}
-		trace_printer = "%s"
-		output { /* no-op */ }
-		`
-
-		in := fmt.Sprintf(format, debugEnabled, printer)
-
-		var args Arguments
-
-		require.NoError(t, syntax.Unmarshal([]byte(in), &args))
-		cfg, err := args.Convert()
-
-		require.NoError(t, err)
-
-		require.Equal(t, debug.TracePrinter(expected), cfg.TracePrinter)
+func TestYAMLGeneration(t *testing.T) {
+	opts := component.Options{
+		Logger: log.NewNopLogger(),
 	}
 
-	// when debug is enabled, the printer will always be overridden to "text"
-	// regardless of what is specified
-	test(true, "json", "text")
-	test(true, "text", "text")
-
-	test(false, "text", "text")
-	test(false, "json", "json")
-}
-
-func TestArguments_ConvertDefaultConfig(t *testing.T) {
-	args := Arguments{}
-	cfg, err := args.Convert()
-	require.NoError(t, err)
-	require.Equal(t, cfg.ChannelBufferLen, beyla.DefaultConfig.ChannelBufferLen)
-	require.Equal(t, cfg.LogLevel, beyla.DefaultConfig.LogLevel)
-	require.Equal(t, cfg.EBPF, beyla.DefaultConfig.EBPF)
-	require.Equal(t, cfg.NetworkFlows, beyla.DefaultConfig.NetworkFlows)
-	require.Equal(t, cfg.Grafana, beyla.DefaultConfig.Grafana)
-	require.Equal(t, cfg.Attributes, beyla.DefaultConfig.Attributes)
-	require.Equal(t, cfg.Routes, beyla.DefaultConfig.Routes)
-	require.Equal(t, cfg.Metrics, beyla.DefaultConfig.Metrics)
-	require.Equal(t, cfg.Traces, beyla.DefaultConfig.Traces)
-	require.Equal(t, cfg.Prometheus, beyla.DefaultConfig.Prometheus)
-	require.Equal(t, cfg.InternalMetrics, beyla.DefaultConfig.InternalMetrics)
-	require.Equal(t, cfg.NetworkFlows, beyla.DefaultConfig.NetworkFlows)
-	require.Equal(t, cfg.Discovery, beyla.DefaultConfig.Discovery)
-	require.Equal(t, cfg.EnforceSysCaps, beyla.DefaultConfig.EnforceSysCaps)
-}
-
-func TestArguments_ValidationErrors(t *testing.T) {
-	tests := []struct {
-		name    string
-		config  string
-		wantErr string
-	}{
-		{
-			name: "invalid regex",
-			config: `
-				discovery {
-					services {
-						exe_path = "["
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-			wantErr: "invalid regular expression \"[\": error parsing regexp: missing closing ]: `[`",
-		},
-		{
-			name: "invalid port range",
-			config: `
-				discovery {
-					services {
-						open_ports = "-8000"
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-			wantErr: `invalid port range "-8000". Must be a comma-separated list of numeric ports or port ranges (e.g. 8000-8999)`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var args Arguments
-			require.NoError(t, syntax.Unmarshal([]byte(tt.config), &args))
-			_, err := args.Convert()
-			require.EqualError(t, err, tt.wantErr)
-		})
-	}
-}
-
-func TestArguments_InvalidExportModes(t *testing.T) {
-	tests := []struct {
-		name   string
-		config string
-	}{
-		{
-			name: "invalid selector",
-			config: `
-				discovery {
-					services {
-						open_ports = "8000"
-						exports = ["foo"]
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-		},
-		{
-			name: "empty selector",
-			config: `
-				discovery {
-					services {
-						open_ports = "8000"
-						exports = [""]
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-		},
-		{
-			name: "one invalid selector",
-			config: `
-				discovery {
-					services {
-						open_ports = "8000"
-						exports = ["metrics", "not traces"]
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var args Arguments
-			require.NoError(t, syntax.Unmarshal([]byte(tt.config), &args))
-			_, err := convertExportModes(args.Discovery.Services[0].ExportModes)
-			require.Error(t, err)
-		})
-	}
-}
-
-func TestArguments_ValidExportModes(t *testing.T) {
-	tests := []struct {
-		name   string
-		config string
-	}{
-		{
-			name: "empty selector",
-			config: `
-				discovery {
-					services {
-						open_ports = "8000"
-						exports = []
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-		},
-		{
-			name: "traces",
-			config: `
-				discovery {
-					services {
-						open_ports = "8000"
-						exports = ["traces"]
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-		},
-		{
-			name: "metrics",
-			config: `
-				discovery {
-					services {
-						open_ports = "8000"
-						exports = ["metrics"]
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-		},
-		{
-			name: "metrics and traces",
-			config: `
-				discovery {
-					services {
-						open_ports = "8000"
-						exports = ["metrics", "traces"]
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-		},
-		{
-			name: "traces and metrics",
-			config: `
-				discovery {
-					services {
-						open_ports = "8000"
-						exports = ["traces", "metrics"]
-					}
-				}
-				metrics {
-					features = ["application"]
-				}
-			`,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var args Arguments
-			require.NoError(t, syntax.Unmarshal([]byte(tt.config), &args))
-		})
-	}
-}
-
-func TestConvert_Routes(t *testing.T) {
-	args := Routes{
-		Unmatch:        "wildcard",
-		Patterns:       []string{"/api/v1/*"},
-		IgnorePatterns: []string{"/api/v1/health"},
-		IgnoredEvents:  "all",
-	}
-
-	expectedConfig := &transform.RoutesConfig{
-		Unmatch:        transform.UnmatchType(args.Unmatch),
-		Patterns:       args.Patterns,
-		IgnorePatterns: args.IgnorePatterns,
-		IgnoredEvents:  transform.IgnoreMode(args.IgnoredEvents),
-		WildcardChar:   "*",
-	}
-
-	config := args.Convert()
-
-	require.Equal(t, expectedConfig, config)
-}
-
-func TestConvert_SamplerConfig(t *testing.T) {
-	tests := []struct {
-		name     string
-		args     SamplerConfig
-		expected services.SamplerConfig
-	}{
-		{
-			name: "with name and arg",
-			args: SamplerConfig{
-				Name: "traceidratio",
-				Arg:  "0.5",
-			},
-			expected: services.SamplerConfig{
-				Name: "traceidratio",
-				Arg:  "0.5",
-			},
-		},
-		{
-			name: "empty config",
-			args: SamplerConfig{},
-			expected: services.SamplerConfig{
-				Name: "",
-				Arg:  "",
-			},
-		},
-		{
-			name: "only name",
-			args: SamplerConfig{
-				Name: "always_on",
-			},
-			expected: services.SamplerConfig{
-				Name: "always_on",
-				Arg:  "",
-			},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			config := tt.args.Convert()
-			require.Equal(t, tt.expected, config)
-		})
-	}
-}
-
-func TestSamplerConfig_Validate(t *testing.T) {
-	tests := []struct {
-		name        string
-		config      SamplerConfig
-		expectError bool
-		errorMsg    string
-	}{
-		{
-			name:        "empty config is valid",
-			config:      SamplerConfig{},
-			expectError: false,
-		},
-		{
-			name: "valid always_on",
-			config: SamplerConfig{
-				Name: "always_on",
-			},
-			expectError: false,
-		},
-		{
-			name: "valid always_off",
-			config: SamplerConfig{
-				Name: "always_off",
-			},
-			expectError: false,
-		},
-		{
-			name: "valid traceidratio with arg",
-			config: SamplerConfig{
-				Name: "traceidratio",
-				Arg:  "0.1",
-			},
-			expectError: false,
-		},
-		{
-			name: "valid parentbased_always_on",
-			config: SamplerConfig{
-				Name: "parentbased_always_on",
-			},
-			expectError: false,
-		},
-		{
-			name: "valid parentbased_always_off",
-			config: SamplerConfig{
-				Name: "parentbased_always_off",
-			},
-			expectError: false,
-		},
-		{
-			name: "valid parentbased_traceidratio with arg",
-			config: SamplerConfig{
-				Name: "parentbased_traceidratio",
-				Arg:  "0.5",
-			},
-			expectError: false,
-		},
-		{
-			name: "invalid sampler name",
-			config: SamplerConfig{
-				Name: "invalid_sampler",
-			},
-			expectError: true,
-			errorMsg:    "invalid sampler name",
-		},
-		{
-			name: "traceidratio without arg",
-			config: SamplerConfig{
-				Name: "traceidratio",
-			},
-			expectError: true,
-			errorMsg:    "requires an arg parameter",
-		},
-		{
-			name: "parentbased_traceidratio without arg",
-			config: SamplerConfig{
-				Name: "parentbased_traceidratio",
-			},
-			expectError: true,
-			errorMsg:    "requires an arg parameter",
-		},
-		{
-			name: "traceidratio with invalid arg",
-			config: SamplerConfig{
-				Name: "traceidratio",
-				Arg:  "invalid",
-			},
-			expectError: true,
-			errorMsg:    "must be a valid decimal number",
-		},
-		{
-			name: "traceidratio with negative ratio",
-			config: SamplerConfig{
-				Name: "traceidratio",
-				Arg:  "-0.1",
-			},
-			expectError: true,
-			errorMsg:    "ratio must be between 0 and 1",
-		},
-		{
-			name: "traceidratio with ratio > 1",
-			config: SamplerConfig{
-				Name: "traceidratio",
-				Arg:  "1.5",
-			},
-			expectError: true,
-			errorMsg:    "ratio must be between 0 and 1",
-		},
-		{
-			name: "parentbased_traceidratio with invalid arg",
-			config: SamplerConfig{
-				Name: "parentbased_traceidratio",
-				Arg:  "not_a_number",
-			},
-			expectError: true,
-			errorMsg:    "must be a valid decimal number",
-		},
-		{
-			name: "traceidratio with boundary values - 0",
-			config: SamplerConfig{
-				Name: "traceidratio",
-				Arg:  "0",
-			},
-			expectError: false,
-		},
-		{
-			name: "traceidratio with boundary values - 1",
-			config: SamplerConfig{
-				Name: "traceidratio",
-				Arg:  "1",
-			},
-			expectError: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			err := tt.config.Validate()
-			if tt.expectError {
-				require.Error(t, err)
-				require.Contains(t, err.Error(), tt.errorMsg)
-			} else {
-				require.NoError(t, err)
-			}
-		})
-	}
-}
-
-func TestConvert_Attributes(t *testing.T) {
-	args := Attributes{
-		Kubernetes: KubernetesDecorator{
-			Enable:               "true",
-			InformersSyncTimeout: 15 * time.Second,
-			MetaCacheAddress:     "localhost:9090",
-		},
-		Select: Selections{
-			{
-				Section: "sql_client_duration",
-				Include: []string{"*"},
-				Exclude: []string{"db_statement"},
-			},
-		},
-		InstanceID: InstanceIDConfig{
-			OverrideHostname: "test",
-		},
-	}
-
-	expectedConfig := beyla.Attributes{
-		Kubernetes: transform.KubernetesDecorator{
-			Enable:                kubeflags.EnableFlag(args.Kubernetes.Enable),
-			InformersSyncTimeout:  15 * time.Second,
-			InformersResyncPeriod: 30 * time.Minute,
-			ResourceLabels:        beyla.DefaultConfig.Attributes.Kubernetes.ResourceLabels,
-			MetaCacheAddress:      "localhost:9090",
-		},
-		HostID: beyla.HostIDConfig{
-			FetchTimeout: 500 * time.Millisecond,
-		},
-		Select: attributes.Selection{
-			"sql_client_duration": {
-				Include: []string{"*"},
-				Exclude: []string{"db_statement"},
-			},
-		},
-		RenameUnresolvedHosts:          "unresolved",
-		RenameUnresolvedHostsOutgoing:  "outgoing",
-		RenameUnresolvedHostsIncoming:  "incoming",
-		MetricSpanNameAggregationLimit: 100,
-	}
-	expectedConfig.InstanceID.OverrideHostname = "test"
-	expectedConfig.InstanceID.HostnameDNSResolution = true
-
-	config := args.Convert()
-
-	require.Equal(t, expectedConfig, config)
-}
-
-func TestConvert_Discovery(t *testing.T) {
-	args := Discovery{
-		Instrument: []Service{
-			{
-				Name:           "test",
-				Namespace:      "default",
-				OpenPorts:      "80",
-				ContainersOnly: true,
-				ExportModes:    []string{"metrics"},
-				Sampler: SamplerConfig{
-					Arg:  "0.5",
-					Name: "traceidratio",
-				},
-			},
-			{
-				Kubernetes: KubernetesService{
-					Namespace:      "default",
-					DeploymentName: "test",
-				},
-			},
-			{
-				Kubernetes: KubernetesService{
-					Namespace:       "default",
-					PodName:         "test",
-					DeploymentName:  "test",
-					ReplicaSetName:  "test",
-					StatefulSetName: "test",
-					DaemonSetName:   "test",
-					OwnerName:       "test",
-					PodLabels:       map[string]string{"test": "test"},
-					PodAnnotations:  map[string]string{"test": "test"},
+	args := Arguments{
+		Discovery: Discovery{
+			Survey: Services{
+				{
+					Path: ".*testserver.*",
 				},
 			},
 		},
-		ExcludeInstrument: []Service{
-			{
-				Name:      "test",
-				Namespace: "default",
-			},
+		Metrics: Metrics{
+			Features:         []string{"application"},
+			Instrumentations: []string{"*"},
 		},
-		DefaultExcludeInstrument: []Service{},
+		Traces: Traces{
+			Instrumentations: []string{"*"},
+		},
+		EBPF: EBPF{
+			ContextPropagation: "disabled",
+		},
 	}
-	config, err := args.Convert()
 
+	comp := &Component{
+		opts:           opts,
+		args:           args,
+		subprocessPort: 12345,
+	}
+
+	configPath, cleanup, err := comp.writeConfigFile()
 	require.NoError(t, err)
-	require.Len(t, config.Instrument, 3)
-	require.Equal(t, "test", config.Instrument[0].Name)
-	require.Equal(t, "default", config.Instrument[0].Namespace)
-	require.Equal(t, services.PortEnum{Ranges: []services.PortRange{{Start: 80, End: 0}}}, config.Instrument[0].OpenPorts)
-	require.True(t, config.Instrument[0].ContainersOnly)
-	require.True(t, config.Instrument[0].ExportModes.CanExportMetrics())
-	require.False(t, config.Instrument[0].ExportModes.CanExportTraces())
-	require.Equal(t, &services.SamplerConfig{Name: "traceidratio", Arg: "0.5"}, config.Instrument[0].SamplerConfig)
-	require.True(t, config.Instrument[1].Metadata[services.AttrNamespace].IsSet())
-	require.True(t, config.Instrument[1].Metadata[services.AttrDeploymentName].IsSet())
-	_, exists := config.Instrument[1].Metadata[services.AttrDaemonSetName]
-	require.False(t, exists)
-	require.True(t, config.Instrument[2].Metadata[services.AttrNamespace].IsSet())
-	require.True(t, config.Instrument[2].Metadata[services.AttrPodName].IsSet())
-	require.True(t, config.Instrument[2].Metadata[services.AttrDeploymentName].IsSet())
-	require.True(t, config.Instrument[2].Metadata[services.AttrReplicaSetName].IsSet())
-	require.True(t, config.Instrument[2].Metadata[services.AttrStatefulSetName].IsSet())
-	require.True(t, config.Instrument[2].Metadata[services.AttrDaemonSetName].IsSet())
-	require.True(t, config.Instrument[2].Metadata[services.AttrOwnerName].IsSet())
-	require.True(t, config.Instrument[2].PodLabels["test"].IsSet())
-	require.True(t, config.Instrument[2].PodAnnotations["test"].IsSet())
-	require.NoError(t, config.Instrument.Validate())
-	require.Len(t, config.ExcludeInstrument, 1)
-	require.Equal(t, "test", config.ExcludeInstrument[0].Name)
-	require.Equal(t, "default", config.ExcludeInstrument[0].Namespace)
-	require.Equal(t, true, config.ExcludeOTelInstrumentedServices)
-}
+	defer cleanup()
 
-func TestConvert_Prometheus(t *testing.T) {
-	args := Metrics{
-		Features:                        []string{"application", "network"},
-		Instrumentations:                []string{"redis", "sql"},
-		AllowServiceGraphSelfReferences: true,
-		ExtraResourceLabels:             nil,
-		ExtraSpanResourceLabels:         []string{"service.version"},
-	}
-
-	expectedConfig := beyla.DefaultConfig.Prometheus
-	expectedConfig.Features = args.Features
-	expectedConfig.Instrumentations = args.Instrumentations
-	expectedConfig.AllowServiceGraphSelfReferences = true
-	expectedConfig.ExtraSpanResourceLabels = args.ExtraSpanResourceLabels
-
-	config := args.Convert()
-
-	require.Equal(t, expectedConfig, config)
-
-	args = Metrics{
-		Features:                        []string{"application", "network"},
-		Instrumentations:                []string{"redis", "sql"},
-		AllowServiceGraphSelfReferences: true,
-		ExtraResourceLabels:             []string{"service.version"},
-	}
-
-	expectedConfig = beyla.DefaultConfig.Prometheus
-	expectedConfig.Features = args.Features
-	expectedConfig.Instrumentations = args.Instrumentations
-	expectedConfig.AllowServiceGraphSelfReferences = true
-	expectedConfig.ExtraResourceLabels = args.ExtraResourceLabels
-	expectedConfig.ExtraSpanResourceLabels = []string{"k8s.cluster.name", "k8s.namespace.name", "service.version", "deployment.environment"}
-
-	config = args.Convert()
-
-	require.Equal(t, expectedConfig, config)
-}
-
-func TestConvert_Network(t *testing.T) {
-	args := Network{
-		AgentIP:          "0.0.0.0",
-		Interfaces:       []string{"eth0"},
-		Protocols:        []string{"TCP", "UDP"},
-		ExcludeProtocols: []string{"ICMP"},
-		Sampling:         1,
-		CIDRs:            []string{"10.0.0.0/8"},
-	}
-
-	expectedConfig := beyla.DefaultConfig.NetworkFlows
-	expectedConfig.Enable = true
-	expectedConfig.AgentIP = "0.0.0.0"
-	expectedConfig.Interfaces = args.Interfaces
-	expectedConfig.Protocols = args.Protocols
-	expectedConfig.ExcludeProtocols = args.ExcludeProtocols
-	expectedConfig.Sampling = 1
-	expectedConfig.Print = false
-	expectedConfig.CIDRs = args.CIDRs
-
-	config := args.Convert(true)
-
-	require.Equal(t, expectedConfig, config)
-}
-
-func TestConvert_EBPF(t *testing.T) {
-	args := EBPF{
-		WakeupLen:           10,
-		TrackRequestHeaders: true,
-		HighRequestVolume:   true,
-		HeuristicSQLDetect:  true,
-		ContextPropagation:  "headers",
-		BpfDebug:            true,
-		ProtocolDebug:       true,
-	}
-
-	expectedConfig := beyla.DefaultConfig.EBPF
-	expectedConfig.WakeupLen = 10
-	expectedConfig.TrackRequestHeaders = true
-	expectedConfig.HighRequestVolume = true
-	expectedConfig.HeuristicSQLDetect = true
-	expectedConfig.ContextPropagation = config.ContextPropagationHeadersOnly
-	expectedConfig.BpfDebug = true
-	expectedConfig.ProtocolDebug = true
-
-	config, err := args.Convert()
+	// Read generated YAML
+	data, err := os.ReadFile(configPath)
 	require.NoError(t, err)
 
-	require.Equal(t, expectedConfig, *config)
+	// Parse YAML
+	var config map[string]interface{}
+	err = yaml.Unmarshal(data, &config)
+	require.NoError(t, err)
+
+	// Verify prometheus_export
+	prometheus, ok := config["prometheus_export"].(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, 12345, prometheus["port"])
+	require.Equal(t, []interface{}{"application"}, prometheus["features"])
+	require.Equal(t, []interface{}{"*"}, prometheus["instrumentations"])
+
+	// Verify discovery
+	discovery, ok := config["discovery"].(map[string]interface{})
+	require.True(t, ok)
+	survey, ok := discovery["survey"].([]interface{})
+	require.True(t, ok)
+	require.Len(t, survey, 1)
+	surveyItem := survey[0].(map[string]interface{})
+	require.Equal(t, ".*testserver.*", surveyItem["exe_path"])
+
+	// Verify ebpf
+	ebpf, ok := config["ebpf"].(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, "disabled", ebpf["context_propagation"])
+
+	// Verify traces
+	traces, ok := config["traces"].(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, []interface{}{"*"}, traces["instrumentations"])
 }
 
-func TestConvert_Filters(t *testing.T) {
-	args := Filters{
-		Application: AttributeFamilies{
-			{
-				Attr:     "transport",
-				NotMatch: "UDP",
-			},
-		},
-		Network: AttributeFamilies{
-			{
-				Attr:  "dst_port",
-				Match: "53",
-			},
-		},
+func TestYAMLGeneration_NetworkFlows(t *testing.T) {
+	opts := component.Options{
+		Logger: log.NewNopLogger(),
 	}
-	expectedConfig := filter.AttributesConfig{
-		Application: filter.AttributeFamilyConfig{
-			"transport": filter.MatchDefinition{
-				NotMatch: "UDP",
-			},
-		},
-		Network: filter.AttributeFamilyConfig{
-			"dst_port": filter.MatchDefinition{
-				Match: "53",
-			},
-		},
-	}
-	config := args.Convert()
 
-	require.Equal(t, expectedConfig, config)
+	args := Arguments{
+		Metrics: Metrics{
+			Features: []string{"network"},
+			Network: Network{
+				Enable:      true,
+				AgentIP:     "0.0.0.0",
+				Interfaces:  []string{"eth0"},
+				Protocols:   []string{"TCP", "UDP"},
+				Sampling:    1,
+				CIDRs:       []string{"10.0.0.0/8"},
+				Direction:   "ingress",
+				AgentIPType: "ipv4",
+			},
+		},
+	}
+
+	comp := &Component{
+		opts:           opts,
+		args:           args,
+		subprocessPort: 12345,
+	}
+
+	configPath, cleanup, err := comp.writeConfigFile()
+	require.NoError(t, err)
+	defer cleanup()
+
+	// Read and parse YAML
+	data, err := os.ReadFile(configPath)
+	require.NoError(t, err)
+
+	var config map[string]interface{}
+	err = yaml.Unmarshal(data, &config)
+	require.NoError(t, err)
+
+	// Verify network_flows
+	networkFlows, ok := config["network_flows"].(map[string]interface{})
+	require.True(t, ok)
+	require.Equal(t, true, networkFlows["enable"])
+	require.Equal(t, "0.0.0.0", networkFlows["agent_ip"])
+	require.Equal(t, []interface{}{"eth0"}, networkFlows["interfaces"])
+	require.Equal(t, []interface{}{"TCP", "UDP"}, networkFlows["protocols"])
+	require.Equal(t, 1, networkFlows["sampling"])
+	require.Equal(t, []interface{}{"10.0.0.0/8"}, networkFlows["cidrs"])
+	require.Equal(t, "ingress", networkFlows["direction"])
+	require.Equal(t, "ipv4", networkFlows["agent_ip_type"])
 }
 
 func TestServices_Validate(t *testing.T) {
@@ -1180,7 +589,6 @@ func TestArguments_Validate(t *testing.T) {
 			name: "valid tracing-only configuration with trace_printer",
 			args: Arguments{
 				TracePrinter: "json",
-				// No metrics features defined
 			},
 		},
 		{
@@ -1189,7 +597,6 @@ func TestArguments_Validate(t *testing.T) {
 				Output: &otelcol.ConsumerArguments{
 					Traces: []otelcol.Consumer{},
 				},
-				// No metrics features defined
 			},
 		},
 		{
@@ -1238,98 +645,149 @@ func TestArguments_Validate(t *testing.T) {
 	}
 }
 
-func TestDeprecatedFields(t *testing.T) {
-	var buf bytes.Buffer
-	var mu sync.Mutex
-
-	// Create a synchronized logger that protects both writing and reading
-	syncLogger := log.LoggerFunc(func(keyvals ...interface{}) error {
-		mu.Lock()
-		defer mu.Unlock()
-		return log.NewLogfmtLogger(&buf).Log(keyvals...)
-	})
-
-	logger := level.NewFilter(syncLogger, level.AllowAll())
-
-	comp := &Component{
-		opts: component.Options{
-			Logger: logger,
-		},
-		args: Arguments{
-			Port:           "8080",
-			ExecutableName: "test-app",
-			Metrics: Metrics{
-				Features: []string{"network"},
-			},
-		},
-	}
-
-	ctx, cancel := context.WithCancel(t.Context())
-	defer cancel()
-
-	// Start component which should trigger warnings
-	go comp.Run(ctx)
-
-	// Verify warnings were logged
-	require.Eventually(t, func() bool {
-		mu.Lock()
-		defer mu.Unlock()
-		output := buf.String()
-		return strings.Contains(output, "level=warn") &&
-			strings.Contains(output, "open_port' field is deprecated") &&
-			strings.Contains(output, "executable_name' field is deprecated")
-	}, time.Second, time.Millisecond*10)
-}
-
-func TestTraces_Convert(t *testing.T) {
+func TestSamplerConfig_Validate(t *testing.T) {
 	tests := []struct {
-		name      string
-		args      Traces
-		consumers []otelcol.Consumer
-		expected  beyla.TracesReceiverConfig
+		name        string
+		config      SamplerConfig
+		expectError bool
+		errorMsg    string
 	}{
 		{
-			name:      "empty config uses default instrumentations",
-			args:      Traces{},
-			consumers: nil,
-			expected: beyla.TracesReceiverConfig{
-				Traces: []beyla.Consumer{},
-				Instrumentations: []string{
-					instrumentations.InstrumentationALL,
-				},
-			},
+			name:        "empty config is valid",
+			config:      SamplerConfig{},
+			expectError: false,
 		},
 		{
-			name: "custom instrumentations",
-			args: Traces{
-				Instrumentations: []string{"http", "grpc"},
+			name: "valid always_on",
+			config: SamplerConfig{
+				Name: "always_on",
 			},
-			consumers: nil,
-			expected: beyla.TracesReceiverConfig{
-				Traces:           []beyla.Consumer{},
-				Instrumentations: []string{"http", "grpc"},
-			},
+			expectError: false,
 		},
 		{
-			name: "with consumers",
-			args: Traces{
-				Instrumentations: []string{"kafka"},
+			name: "valid always_off",
+			config: SamplerConfig{
+				Name: "always_off",
 			},
-			consumers: []otelcol.Consumer{
-				// Mock consumer would go here in real test
+			expectError: false,
+		},
+		{
+			name: "valid traceidratio with arg",
+			config: SamplerConfig{
+				Name: "traceidratio",
+				Arg:  "0.1",
 			},
-			expected: beyla.TracesReceiverConfig{
-				Traces:           []beyla.Consumer{},
-				Instrumentations: []string{"kafka"},
+			expectError: false,
+		},
+		{
+			name: "valid parentbased_always_on",
+			config: SamplerConfig{
+				Name: "parentbased_always_on",
 			},
+			expectError: false,
+		},
+		{
+			name: "valid parentbased_always_off",
+			config: SamplerConfig{
+				Name: "parentbased_always_off",
+			},
+			expectError: false,
+		},
+		{
+			name: "valid parentbased_traceidratio with arg",
+			config: SamplerConfig{
+				Name: "parentbased_traceidratio",
+				Arg:  "0.5",
+			},
+			expectError: false,
+		},
+		{
+			name: "invalid sampler name",
+			config: SamplerConfig{
+				Name: "invalid_sampler",
+			},
+			expectError: true,
+			errorMsg:    "invalid sampler name",
+		},
+		{
+			name: "traceidratio without arg",
+			config: SamplerConfig{
+				Name: "traceidratio",
+			},
+			expectError: true,
+			errorMsg:    "requires an arg parameter",
+		},
+		{
+			name: "parentbased_traceidratio without arg",
+			config: SamplerConfig{
+				Name: "parentbased_traceidratio",
+			},
+			expectError: true,
+			errorMsg:    "requires an arg parameter",
+		},
+		{
+			name: "traceidratio with invalid arg",
+			config: SamplerConfig{
+				Name: "traceidratio",
+				Arg:  "invalid",
+			},
+			expectError: true,
+			errorMsg:    "must be a valid decimal number",
+		},
+		{
+			name: "traceidratio with negative ratio",
+			config: SamplerConfig{
+				Name: "traceidratio",
+				Arg:  "-0.1",
+			},
+			expectError: true,
+			errorMsg:    "ratio must be between 0 and 1",
+		},
+		{
+			name: "traceidratio with ratio > 1",
+			config: SamplerConfig{
+				Name: "traceidratio",
+				Arg:  "1.5",
+			},
+			expectError: true,
+			errorMsg:    "ratio must be between 0 and 1",
+		},
+		{
+			name: "parentbased_traceidratio with invalid arg",
+			config: SamplerConfig{
+				Name: "parentbased_traceidratio",
+				Arg:  "not_a_number",
+			},
+			expectError: true,
+			errorMsg:    "must be a valid decimal number",
+		},
+		{
+			name: "traceidratio with boundary values - 0",
+			config: SamplerConfig{
+				Name: "traceidratio",
+				Arg:  "0",
+			},
+			expectError: false,
+		},
+		{
+			name: "traceidratio with boundary values - 1",
+			config: SamplerConfig{
+				Name: "traceidratio",
+				Arg:  "1",
+			},
+			expectError: false,
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			result := tt.args.Convert(tt.consumers)
-			require.Equal(t, tt.expected.Instrumentations, result.Instrumentations)
-			require.Len(t, result.Traces, len(tt.expected.Traces))
+			err := tt.config.Validate()
+			if tt.expectError {
+				require.Error(t, err)
+				require.Contains(t, err.Error(), tt.errorMsg)
+			} else {
+				require.NoError(t, err)
+			}
 		})
 	}
 }
@@ -1456,117 +914,45 @@ func TestArguments_Validate_TracesOutputRequired(t *testing.T) {
 	}
 }
 
-func TestServices_Convert_SamplerConfig(t *testing.T) {
-	tests := []struct {
-		name                string
-		services            Services
-		expectSamplerConfig bool
-		expectedSamplerName string
-	}{
-		{
-			name: "service with empty sampler config",
-			services: Services{
-				{
-					OpenPorts: "80",
-					Sampler:   SamplerConfig{}, // Empty sampler
-				},
-			},
-			expectSamplerConfig: false,
-		},
-		{
-			name: "service with sampler config",
-			services: Services{
-				{
-					OpenPorts: "80",
-					Sampler: SamplerConfig{
-						Name: "traceidratio",
-						Arg:  "0.5",
-					},
-				},
-			},
-			expectSamplerConfig: true,
-			expectedSamplerName: "traceidratio",
-		},
-		{
-			name: "service with only sampler name",
-			services: Services{
-				{
-					OpenPorts: "80",
-					Sampler: SamplerConfig{
-						Name: "always_on",
-					},
-				},
-			},
-			expectSamplerConfig: true,
-			expectedSamplerName: "always_on",
-		},
-	}
+func TestDeprecatedFields(t *testing.T) {
+	var buf bytes.Buffer
+	var mu sync.Mutex
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			result, err := tt.services.Convert()
-			require.NoError(t, err)
-			require.Len(t, result, 1)
+	// Create a synchronized logger that protects both writing and reading
+	syncLogger := log.LoggerFunc(func(keyvals ...interface{}) error {
+		mu.Lock()
+		defer mu.Unlock()
+		return log.NewLogfmtLogger(&buf).Log(keyvals...)
+	})
 
-			if tt.expectSamplerConfig {
-				require.NotNil(t, result[0].SamplerConfig)
-				require.Equal(t, tt.expectedSamplerName, result[0].SamplerConfig.Name)
-			} else {
-				require.Nil(t, result[0].SamplerConfig)
-			}
-		})
-	}
-}
+	logger := level.NewFilter(syncLogger, level.AllowAll())
 
-func TestEnvVars(t *testing.T) {
 	comp := &Component{
-		args: Arguments{
-			TracePrinter: "text",
+		opts: component.Options{
+			Logger: logger,
 		},
-	}
-
-	t.Setenv("BEYLA_TRACE_PRINTER", "json")
-
-	cfg, err := comp.loadConfig()
-
-	require.NoError(t, err)
-	require.Equal(t, debug.TracePrinterJSON, cfg.TracePrinter)
-}
-
-func TestSurveyDisabled(t *testing.T) {
-	comp := &Component{
 		args: Arguments{
-			TracePrinter: "text",
-		},
-	}
-
-	cfg, err := comp.loadConfig()
-
-	require.NoError(t, err)
-	require.False(t, cfg.Discovery.SurveyEnabled())
-	require.NotEqual(t, beylaSvc.DefaultExcludeServicesWithSurvey, cfg.Discovery.DefaultExcludeServices)
-	require.NotEqual(t, beylaSvc.DefaultExcludeInstrumentWithSurvey, cfg.Discovery.DefaultExcludeInstrument)
-}
-
-func TestSurveyEnabled(t *testing.T) {
-	comp := &Component{
-		args: Arguments{
-			TracePrinter: "text",
-			Discovery: Discovery{
-				Survey: Services{
-					{
-						Name: "foo",
-					},
-				},
+			Port:           "8080",
+			ExecutableName: "test-app",
+			Metrics: Metrics{
+				Features: []string{"network"},
 			},
 		},
 	}
 
-	cfg, err := comp.loadConfig()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
-	require.NoError(t, err)
-	require.Len(t, cfg.Discovery.Survey, 1)
-	require.True(t, cfg.Discovery.SurveyEnabled())
-	require.Equal(t, beylaSvc.DefaultExcludeServicesWithSurvey, cfg.Discovery.DefaultExcludeServices)
-	require.Equal(t, beylaSvc.DefaultExcludeInstrumentWithSurvey, cfg.Discovery.DefaultExcludeInstrument)
+	// Start component which should trigger warnings
+	go comp.Run(ctx)
+
+	// Verify warnings were logged
+	require.Eventually(t, func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		output := buf.String()
+		return strings.Contains(output, "level=warn") &&
+			strings.Contains(output, "open_port' field is deprecated") &&
+			strings.Contains(output, "executable_name' field is deprecated")
+	}, time.Second, time.Millisecond*10)
 }
