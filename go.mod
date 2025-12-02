@@ -504,7 +504,7 @@ require (
 	github.com/benbjohnson/clock v1.3.5 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/bmatcuk/doublestar/v4 v4.9.1 // indirect
-	github.com/caarlos0/env/v9 v9.0.0
+	github.com/caarlos0/env/v9 v9.0.0 // indirect
 	github.com/cenkalti/backoff/v4 v4.3.0 // indirect
 	github.com/cenkalti/backoff/v5 v5.0.3 // indirect
 	github.com/census-instrumentation/opencensus-proto v0.4.1 // indirect
@@ -522,7 +522,6 @@ require (
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/containerd/platforms v1.0.0-rc.1 // indirect
 	github.com/containerd/ttrpc v1.2.7 // indirect
-	github.com/containers/common v0.64.2 // indirect
 	github.com/coreos/go-semver v0.3.1 // indirect
 	github.com/cpuguy83/dockercfg v0.3.2 // indirect
 	github.com/creack/pty v1.1.24 // indirect
@@ -616,10 +615,8 @@ require (
 	github.com/gorilla/websocket v1.5.4-0.20250319132907-e064f32e3674 // indirect
 	github.com/gosnmp/gosnmp v1.41.0 // indirect
 	github.com/grafana/faro/pkg/go v0.0.0-20250314155512-06a06da3b8bc // indirect
-	github.com/grafana/go-offsets-tracker v0.1.7 // indirect
 	github.com/grafana/gomemcache v0.0.0-20250828162811-a96f6acee2fe // indirect
 	github.com/grafana/jfr-parser v0.9.3 // indirect
-	github.com/grafana/jvmtools v0.0.3 // indirect
 	github.com/grafana/otel-profiling-go v0.5.1 // indirect
 	github.com/grobie/gomemcache v0.0.0-20230213081705-239240bbc445 // indirect
 	github.com/grpc-ecosystem/grpc-gateway/v2 v2.27.2 // indirect
@@ -999,6 +996,8 @@ require (
 	github.com/go-openapi/swag/yamlutils v0.25.1 // indirect
 	github.com/linode/go-metadata v0.2.2 // indirect
 	github.com/mitchellh/hashstructure v1.1.0 // indirect
+	github.com/onsi/ginkgo/v2 v2.23.4 // indirect
+	github.com/onsi/gomega v1.37.0 // indirect
 	github.com/open-telemetry/opamp-go v0.22.0 // indirect
 	github.com/open-telemetry/opentelemetry-collector-contrib/extension/opampcustommessages v0.139.0 // indirect
 	github.com/twmb/franz-go/pkg/kadm v1.17.1 // indirect

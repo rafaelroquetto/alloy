@@ -670,8 +670,6 @@ github.com/containerd/ttrpc v1.2.7 h1:qIrroQvuOL9HQ1X6KHe2ohc7p+HP/0VE6XPU7elJRq
 github.com/containerd/ttrpc v1.2.7/go.mod h1:YCXHsb32f+Sq5/72xHubdiJRQY9inL4a4ZQrAbN1q9o=
 github.com/containerd/typeurl v1.0.2 h1:Chlt8zIieDbzQFzXzAeBEF92KhExuE4p9p92/QmY7aY=
 github.com/containerd/typeurl v1.0.2/go.mod h1:9trJWW2sRlGub4wZJRTW83VtbOLS6hwcDZXTn6oPz9s=
-github.com/containers/common v0.64.2 h1:1xepE7QwQggUXxmyQ1Dbh6Cn0yd7ktk14sN3McSWf5I=
-github.com/containers/common v0.64.2/go.mod h1:o29GfYy4tefUuShm8mOn2AiL5Mpzdio+viHI7n24KJ4=
 github.com/coreos/bbolt v1.3.2/go.mod h1:iRUV2dpdMOn7Bo10OQBFzIJO9kkE559Wcmn+qkEiiKk=
 github.com/coreos/etcd v3.3.10+incompatible/go.mod h1:uF7uidLiAD3TWHmW31ZFd/JWoc32PjwdhPthX9715RE=
 github.com/coreos/go-etcd v2.0.0+incompatible/go.mod h1:Jez6KQU2B/sWsbdaef3ED8NzMklzPG4d5KIOhIy30Tk=
@@ -1134,8 +1132,6 @@ github.com/grafana/faro/pkg/go v0.0.0-20250314155512-06a06da3b8bc h1:o8BraeLtggP
 github.com/grafana/faro/pkg/go v0.0.0-20250314155512-06a06da3b8bc/go.mod h1:4CP5sfwz5+uVfNgCeA5/N6csXnzOgnkgT1jh57ASaK4=
 github.com/grafana/go-gelf/v2 v2.0.1 h1:BOChP0h/jLeD+7F9mL7tq10xVkDG15he3T1zHuQaWak=
 github.com/grafana/go-gelf/v2 v2.0.1/go.mod h1:lexHie0xzYGwCgiRGcvZ723bSNyNI8ZRD4s0CLobh90=
-github.com/grafana/go-offsets-tracker v0.1.7 h1:2zBQ7iiGzvyXY7LA8kaaSiEqH/Yx82UcfRabbY5aOG4=
-github.com/grafana/go-offsets-tracker v0.1.7/go.mod h1:qcQdu7zlUKIFNUdBJlLyNHuJGW0SKWKjkrN6jtt+jds=
 github.com/grafana/gomemcache v0.0.0-20250828162811-a96f6acee2fe h1:q+QaVANzNZxvTovycpQvDTfsNZ2rHh4XIIaccMnrIR4=
 github.com/grafana/gomemcache v0.0.0-20250828162811-a96f6acee2fe/go.mod h1:j/s0jkda4UXTemDs7Pgw/vMT06alWc42CHisvYac0qw=
 github.com/grafana/jfr-parser v0.9.3 h1:rMrDfV7U5Ycz12/d57sQrN7UHmt1N6Wi6SSuNKi8hyk=
@@ -1144,8 +1140,6 @@ github.com/grafana/jfr-parser/pprof v0.0.4 h1:QIpA0tTgG17m/l2B6X0tqf8dZu+AN/UY6B
 github.com/grafana/jfr-parser/pprof v0.0.4/go.mod h1:7aJk80IjMxc2iaUlliRUgA+bq2ZFTgEQfZgjioL4cvg=
 github.com/grafana/jsonparser v0.0.0-20241004153430-023329977675 h1:U94jQ2TQr1m3HNyE8efSdyaBbDrdPaWImXyenuKZ/nw=
 github.com/grafana/jsonparser v0.0.0-20241004153430-023329977675/go.mod h1:796sq+UcONnSlzA3RtlBZ+b/hrerkZXiEmO8oMjyRwY=
-github.com/grafana/jvmtools v0.0.3 h1:4uPquep5v+54Z04OQYOCldrv2SR42IRagHQXrNHsc4g=
-github.com/grafana/jvmtools v0.0.3/go.mod h1:b0tiPI5zNyIuPUz2DwvxUCI+5bFoG7A4i47F9sc8w98=
 github.com/grafana/kafka_exporter v0.0.0-20240409084445-5e3488ad9f9a h1:jqM4NNdx8LSquKo8bPx+XWn91S2b+sgNvEcFfSJQtHY=
 github.com/grafana/kafka_exporter v0.0.0-20240409084445-5e3488ad9f9a/go.mod h1:ZXGGyeTUMenf/H1CDBK9lv3azjswfa0nVzLoQAYmnDc=
 github.com/grafana/loki/pkg/push v0.0.0-20251021174646-053429db2124 h1:foSyX5m6IbhiTNh0AmLTv3+pwzYmbG/EmhXPhhYHkVQ=

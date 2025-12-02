@@ -22,9 +22,10 @@
 ##
 ## Targets for building binaries:
 ##
-##   binaries       Compiles all binaries.
-##   alloy          Compiles Alloy to $(ALLOY_BINARY)
-##   alloy-service  Compiles internal/cmd/alloy-service to $(SERVICE_BINARY)
+##   binaries        Compiles all binaries.
+##   alloy           Compiles Alloy to $(ALLOY_BINARY) (auto-downloads Beyla if needed)
+##   alloy-service   Compiles internal/cmd/alloy-service to $(SERVICE_BINARY)
+##   download-beyla  Download Beyla binaries for embedding
 ##
 ## Targets for building Docker images:
 ##
@@ -75,6 +76,7 @@
 ##   GO_TAGS              Extra tags to use when building.
 ##   DOCKER_PLATFORM      Overrides platform to build Docker images for (defaults to host platform).
 ##   GOEXPERIMENT         Used to enable Go features behind feature flags.
+##   BEYLA_VERSION        Version of Beyla to download and embed (default v2.7.9).
 
 include tools/make/*.mk
 
@@ -89,6 +91,12 @@ GOARM                ?= $(shell go env GOARM)
 CGO_ENABLED          ?= 1
 RELEASE_BUILD        ?= 0
 GOEXPERIMENT         ?= $(shell go env GOEXPERIMENT)
+
+# Beyla embedding configuration
+BEYLA_VERSION        ?= v2.7.9
+BEYLA_BINARY_DIR     := internal/component/beyla/ebpf
+BEYLA_BINARY_AMD64   := $(BEYLA_BINARY_DIR)/beyla_binary_amd64
+BEYLA_BINARY_ARM64   := $(BEYLA_BINARY_DIR)/beyla_binary_arm64
 
 # Determine the golangci-lint binary path using Make functions where possible.
 # Priority: GOBIN, GOPATH/bin, PATH (via shell), Fallback Name.
@@ -192,7 +200,35 @@ integration-test-k8s: alloy-image
 .PHONY: binaries alloy
 binaries: alloy
 
-alloy:
+# Download Beyla binaries for embedding
+.PHONY: download-beyla
+download-beyla:
+	@echo "Downloading Beyla $(BEYLA_VERSION) binaries..."
+	@mkdir -p /tmp/beyla-download
+	@# Download AMD64
+	@echo "  Downloading AMD64..."
+	@curl -L -f -o /tmp/beyla-download/beyla-amd64.tar.gz \
+		"https://github.com/grafana/beyla/releases/download/$(BEYLA_VERSION)/beyla-linux-amd64-$(BEYLA_VERSION).tar.gz"
+	@tar -xzf /tmp/beyla-download/beyla-amd64.tar.gz -C /tmp/beyla-download
+	@find /tmp/beyla-download -name "beyla" -type f | head -n 1 | xargs -I {} cp {} $(BEYLA_BINARY_AMD64)
+	@chmod +x $(BEYLA_BINARY_AMD64)
+	@# Download ARM64
+	@echo "  Downloading ARM64..."
+	@curl -L -f -o /tmp/beyla-download/beyla-arm64.tar.gz \
+		"https://github.com/grafana/beyla/releases/download/$(BEYLA_VERSION)/beyla-linux-arm64-$(BEYLA_VERSION).tar.gz"
+	@tar -xzf /tmp/beyla-download/beyla-arm64.tar.gz -C /tmp/beyla-download
+	@find /tmp/beyla-download -name "beyla" -type f | tail -n 1 | xargs -I {} cp {} $(BEYLA_BINARY_ARM64)
+	@chmod +x $(BEYLA_BINARY_ARM64)
+	@rm -rf /tmp/beyla-download
+	@echo "  ✓ Downloaded Beyla $(BEYLA_VERSION) binaries"
+	@ls -lh $(BEYLA_BINARY_AMD64) $(BEYLA_BINARY_ARM64)
+
+# Check if Beyla binaries exist
+$(BEYLA_BINARY_AMD64) $(BEYLA_BINARY_ARM64):
+	@echo "Beyla binaries not found. Downloading..."
+	@$(MAKE) download-beyla
+
+alloy: $(BEYLA_BINARY_AMD64) $(BEYLA_BINARY_ARM64)
 ifeq ($(USE_CONTAINER),1)
 	$(RERUN_IN_CONTAINER)
 else
@@ -311,8 +347,13 @@ endif
 # Makefile.build-container.
 
 .PHONY: clean
-clean: clean-dist clean-build-container-cache
+clean: clean-dist clean-build-container-cache clean-beyla
 	rm -rf ./build/*
+
+.PHONY: clean-beyla
+clean-beyla:
+	@echo "Cleaning Beyla binaries..."
+	@rm -f $(BEYLA_BINARY_AMD64) $(BEYLA_BINARY_ARM64)
 
 .PHONY: info
 info:
@@ -329,6 +370,7 @@ info:
 	@printf "VERSION             = $(VERSION)\n"
 	@printf "GO_TAGS             = $(GO_TAGS)\n"
 	@printf "GOEXPERIMENT        = $(GOEXPERIMENT)\n"
+	@printf "BEYLA_VERSION       = $(BEYLA_VERSION)\n"
 
 # awk magic to print out the comment block at the top of this file.
 .PHONY: help

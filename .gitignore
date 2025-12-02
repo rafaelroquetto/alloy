@@ -38,3 +38,7 @@ node_modules
 # local testing files
 /targets.yaml
 /config.alloy
+
+# Beyla embedded binaries (downloaded at build time)
+internal/component/beyla/ebpf/beyla_binary_amd64
+internal/component/beyla/ebpf/beyla_binary_arm64

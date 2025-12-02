@@ -5,42 +5,33 @@ package beyla
 import (
 	"context"
 	"fmt"
-	"log/slog"
+	"net"
 	"net/http"
+	"net/http/httputil"
+	"net/url"
 	"os"
+	"os/exec"
 	"path"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
-	"github.com/caarlos0/env/v9"
-	"github.com/grafana/beyla/v2/pkg/beyla"
-	"github.com/grafana/beyla/v2/pkg/components"
-	beylaCfg "github.com/grafana/beyla/v2/pkg/config"
-	beylaSvc "github.com/grafana/beyla/v2/pkg/services"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/go-kit/log"
 	"github.com/prometheus/common/model"
-	"go.opentelemetry.io/obi/pkg/export/attributes"
-	"go.opentelemetry.io/obi/pkg/export/debug"
-	"go.opentelemetry.io/obi/pkg/export/instrumentations"
-	"go.opentelemetry.io/obi/pkg/export/prom"
-	"go.opentelemetry.io/obi/pkg/filter"
-	"go.opentelemetry.io/obi/pkg/kubeflags"
-	"go.opentelemetry.io/obi/pkg/services"
-	"go.opentelemetry.io/obi/pkg/transform"
 	"golang.org/x/sync/errgroup" //nolint:depguard
+	"gopkg.in/yaml.v3"
 
 	"github.com/grafana/alloy/internal/component"
 	"github.com/grafana/alloy/internal/component/discovery"
-	"github.com/grafana/alloy/internal/component/otelcol"
 	"github.com/grafana/alloy/internal/featuregate"
 	"github.com/grafana/alloy/internal/runtime/logging/level"
 	http_service "github.com/grafana/alloy/internal/service/http"
 )
 
 func init() {
-	beyla.OverrideOBIGlobalConfig()
+	setupBeylaEnvironment()
 	component.Register(component.Registration{
 		Name:      "beyla.ebpf",
 		Stability: featuregate.StabilityGenerallyAvailable,
@@ -53,14 +44,30 @@ func init() {
 	})
 }
 
+// setupBeylaEnvironment duplicates any BEYLA_ prefixed environment variables with the OTEL_EBPF_ prefix.
+// This allows the Beyla subprocess to recognize Beyla-specific environment variables.
+func setupBeylaEnvironment() {
+	// Note: We no longer override OBI globals since we generate YAML config directly.
+	// The Beyla subprocess will handle its own internal configuration from the YAML we provide.
+	// Environment variable duplication is handled by Beyla itself when it starts.
+}
+
 type Component struct {
 	opts       component.Options
 	mut        sync.Mutex
 	args       Arguments
 	argsUpdate chan Arguments
-	reg        *prometheus.Registry
-	healthMut  sync.RWMutex
-	health     component.Health
+
+	// Subprocess-specific fields
+	subprocessPort int       // Port where Beyla subprocess listens
+	subprocessAddr string    // Full address (http://localhost:PORT)
+	subprocessCmd  *exec.Cmd // The running subprocess
+	beylaExePath   string    // Path to extracted Beyla binary
+	configPath     string    // Path to config file
+	cleanupFuncs   []func()  // Cleanup functions for temp files
+
+	healthMut sync.RWMutex
+	health    component.Health
 }
 
 var _ component.HealthComponent = (*Component)(nil)
@@ -76,20 +83,6 @@ const (
 
 var validInstrumentations = map[string]struct{}{
 	"*": {}, "http": {}, "grpc": {}, "redis": {}, "kafka": {}, "sql": {}, "gpu": {}, "mongo": {},
-}
-
-func (args Routes) Convert() *transform.RoutesConfig {
-	routes := beyla.DefaultConfig.Routes
-	if args.Unmatch != "" {
-		routes.Unmatch = transform.UnmatchType(args.Unmatch)
-	}
-	routes.Patterns = args.Patterns
-	routes.IgnorePatterns = args.IgnorePatterns
-	routes.IgnoredEvents = transform.IgnoreMode(args.IgnoredEvents)
-	if args.WildcardChar != "" {
-		routes.WildcardChar = args.WildcardChar
-	}
-	return routes
 }
 
 func (args SamplerConfig) Validate() error {
@@ -131,452 +124,6 @@ func (args SamplerConfig) Validate() error {
 	return nil
 }
 
-func (args SamplerConfig) Convert() services.SamplerConfig {
-	return services.SamplerConfig{
-		Name: args.Name,
-		Arg:  args.Arg,
-	}
-}
-
-func (args Attributes) Convert() beyla.Attributes {
-	attrs := beyla.DefaultConfig.Attributes
-	// Kubernetes
-	if args.Kubernetes.Enable != "" {
-		attrs.Kubernetes.Enable = kubeflags.EnableFlag(args.Kubernetes.Enable)
-	}
-	if args.Kubernetes.InformersSyncTimeout != 0 {
-		attrs.Kubernetes.InformersSyncTimeout = args.Kubernetes.InformersSyncTimeout
-	}
-	if args.Kubernetes.InformersResyncPeriod != 0 {
-		attrs.Kubernetes.InformersResyncPeriod = args.Kubernetes.InformersResyncPeriod
-	}
-	attrs.Kubernetes.DisableInformers = args.Kubernetes.DisableInformers
-	attrs.Kubernetes.MetaRestrictLocalNode = args.Kubernetes.MetaRestrictLocalNode
-	attrs.Kubernetes.ClusterName = args.Kubernetes.ClusterName
-	if args.Kubernetes.MetaCacheAddress != "" {
-		attrs.Kubernetes.MetaCacheAddress = args.Kubernetes.MetaCacheAddress
-	}
-	// InstanceID
-	if args.InstanceID.HostnameDNSResolution {
-		attrs.InstanceID.HostnameDNSResolution = args.InstanceID.HostnameDNSResolution
-	}
-	attrs.InstanceID.OverrideHostname = args.InstanceID.OverrideHostname
-	// Selection
-	if args.Select != nil {
-		attrs.Select = args.Select.Convert()
-	}
-	return attrs
-}
-
-func (args Selections) Convert() attributes.Selection {
-	s := attributes.Selection{}
-	for _, a := range args {
-		s[attributes.Section(a.Section)] = attributes.InclusionLists{
-			Include: a.Include,
-			Exclude: a.Exclude,
-		}
-	}
-	return s
-}
-
-func (args Discovery) Convert() (beylaSvc.BeylaDiscoveryConfig, error) {
-	d := beyla.DefaultConfig.Discovery
-
-	// Services (deprecated)
-	srv, err := args.Services.Convert()
-	if err != nil {
-		return d, err
-	}
-	d.Services = srv
-	excludeSrv, err := args.ExcludeServices.Convert()
-	if err != nil {
-		return d, err
-	}
-	d.ExcludeServices = excludeSrv
-	if args.DefaultExcludeServices != nil {
-		defaultExcludeSrv, err := args.DefaultExcludeServices.Convert()
-		if err != nil {
-			return d, err
-		}
-		d.DefaultExcludeServices = defaultExcludeSrv
-	}
-
-	if len(args.Instrument) > 0 {
-		instrument, err := args.Instrument.ConvertGlob()
-		if err != nil {
-			return d, err
-		}
-		d.Instrument = instrument
-	}
-
-	if len(args.ExcludeInstrument) > 0 {
-		excludeInstrument, err := args.ExcludeInstrument.ConvertGlob()
-		if err != nil {
-			return d, err
-		}
-		d.ExcludeInstrument = excludeInstrument
-	}
-
-	if len(args.DefaultExcludeInstrument) > 0 {
-		defaultExcludeInstrument, err := args.DefaultExcludeInstrument.ConvertGlob()
-		if err != nil {
-			return d, err
-		}
-		d.DefaultExcludeInstrument = defaultExcludeInstrument
-	}
-
-	// Survey
-	survey, err := args.Survey.ConvertGlob()
-	if err != nil {
-		return d, err
-	}
-	d.Survey = survey
-
-	// Common fields
-	d.SkipGoSpecificTracers = args.SkipGoSpecificTracers
-	if args.ExcludeOTelInstrumentedServices {
-		d.ExcludeOTelInstrumentedServices = args.ExcludeOTelInstrumentedServices
-	}
-	return d, nil
-}
-
-func convertExportModes(modes []string) (services.ExportModes, error) {
-	if modes == nil {
-		return services.ExportModeUnset, nil
-	}
-
-	ret := services.NewExportModes()
-
-	for _, m := range modes {
-		switch m {
-		case "metrics":
-			ret.AllowMetrics()
-		case "traces":
-			ret.AllowTraces()
-		default:
-			return ret, fmt.Errorf("invalid export mode: '%s'", m)
-		}
-	}
-
-	return ret, nil
-}
-
-func serviceConvert[Attr any](
-	s Service,
-	convertFunc func(string) (Attr, error),
-	convertKubernetesFunc func(KubernetesService) (map[string]*Attr, error)) (services.PortEnum, Attr, map[string]*Attr, map[string]*Attr, map[string]*Attr, services.ExportModes, error) {
-
-	var paths Attr
-	var kubernetes map[string]*Attr
-	var podLabels map[string]*Attr
-	var podAnnotations map[string]*Attr
-	var exportModes services.ExportModes
-
-	ports, err := stringToPortEnum(s.OpenPorts)
-	if err != nil {
-		return ports, paths, kubernetes, podLabels, podAnnotations, exportModes, err
-	}
-	paths, err = convertFunc(s.Path)
-	if err != nil {
-		return ports, paths, kubernetes, podLabels, podAnnotations, exportModes, err
-	}
-	kubernetes, err = convertKubernetesFunc(s.Kubernetes)
-	if err != nil {
-		return ports, paths, kubernetes, podLabels, podAnnotations, exportModes, err
-	}
-	podLabels = map[string]*Attr{}
-	for k, v := range s.Kubernetes.PodLabels {
-		label, err := convertFunc(v)
-		if err != nil {
-			return ports, paths, kubernetes, podLabels, podAnnotations, exportModes, err
-		}
-		podLabels[k] = &label
-	}
-	// Convert pod annotations to attributes
-	podAnnotations = map[string]*Attr{}
-	for k, v := range s.Kubernetes.PodAnnotations {
-		annotation, err := convertFunc(v)
-		if err != nil {
-			return ports, paths, kubernetes, podLabels, podAnnotations, exportModes, err
-		}
-		podAnnotations[k] = &annotation
-	}
-
-	exportModes, err = convertExportModes(s.ExportModes)
-
-	if err != nil {
-		return ports, paths, kubernetes, podLabels, podAnnotations, exportModes, err
-	}
-
-	return ports, paths, kubernetes, podLabels, podAnnotations, exportModes, nil
-}
-
-func (args Services) Convert() (services.RegexDefinitionCriteria, error) {
-	var attrs services.RegexDefinitionCriteria
-	for _, s := range args {
-		ports, paths, kubernetes, podLabels, podAnnotations, exportModes, err := serviceConvert(
-			s,
-			stringToRegexpAttr,
-			convertKubernetes,
-		)
-
-		if err != nil {
-			return nil, err
-		}
-
-		var samplerConfig *services.SamplerConfig
-		if s.Sampler.Name != "" || s.Sampler.Arg != "" {
-			config := s.Sampler.Convert()
-			samplerConfig = &config
-		}
-		attrs = append(attrs, services.RegexSelector{
-			Name:           s.Name,
-			Namespace:      s.Namespace,
-			OpenPorts:      ports,
-			Path:           paths,
-			Metadata:       kubernetes,
-			PodLabels:      podLabels,
-			ContainersOnly: s.ContainersOnly,
-			PodAnnotations: podAnnotations,
-			ExportModes:    exportModes,
-			SamplerConfig:  samplerConfig,
-		})
-	}
-	return attrs, nil
-}
-
-func (args Services) ConvertGlob() (services.GlobDefinitionCriteria, error) {
-	var attrs services.GlobDefinitionCriteria
-	for _, s := range args {
-		ports, paths, kubernetes, podLabels, podAnnotations, exportModes, err := serviceConvert(
-			s,
-			stringToGlobAttr,
-			convertKubernetesGlob,
-		)
-
-		if err != nil {
-			return nil, err
-		}
-
-		var samplerConfig *services.SamplerConfig
-		if s.Sampler.Name != "" || s.Sampler.Arg != "" {
-			config := s.Sampler.Convert()
-			samplerConfig = &config
-		}
-		attrs = append(attrs, services.GlobAttributes{
-			Name:           s.Name,
-			Namespace:      s.Namespace,
-			OpenPorts:      ports,
-			Path:           paths,
-			Metadata:       kubernetes,
-			PodLabels:      podLabels,
-			ContainersOnly: s.ContainersOnly,
-			PodAnnotations: podAnnotations,
-			ExportModes:    exportModes,
-			SamplerConfig:  samplerConfig,
-		})
-	}
-	return attrs, nil
-}
-
-func (args Services) Validate() error {
-	for i, svc := range args {
-		// Check if any Kubernetes fields are defined
-		hasKubernetes := svc.Kubernetes.Namespace != "" ||
-			svc.Kubernetes.PodName != "" ||
-			svc.Kubernetes.DeploymentName != "" ||
-			svc.Kubernetes.ReplicaSetName != "" ||
-			svc.Kubernetes.StatefulSetName != "" ||
-			svc.Kubernetes.DaemonSetName != "" ||
-			svc.Kubernetes.OwnerName != "" ||
-			len(svc.Kubernetes.PodLabels) > 0
-
-		if svc.OpenPorts == "" && svc.Path == "" && !hasKubernetes {
-			return fmt.Errorf("discovery.services[%d] must define at least one of: open_ports, exe_path, or kubernetes configuration", i)
-		}
-	}
-	return nil
-}
-
-func convertKubernetesAttributes[T any, Attr any](
-	args T,
-	getters []func(T) (string, string),
-	convertFunc func(string) (Attr, error),
-) (map[string]*Attr, error) {
-
-	metadata := map[string]*Attr{}
-	for _, getter := range getters {
-		alloyAttr, beylaAttr := getter(args)
-		if alloyAttr != "" {
-			attr, err := convertFunc(alloyAttr)
-			if err != nil {
-				return nil, err
-			}
-			metadata[beylaAttr] = &attr
-		}
-	}
-	return metadata, nil
-}
-
-var kubernetesGetters = []func(KubernetesService) (string, string){
-	func(a KubernetesService) (string, string) { return a.Namespace, services.AttrNamespace },
-	func(a KubernetesService) (string, string) { return a.PodName, services.AttrPodName },
-	func(a KubernetesService) (string, string) { return a.DeploymentName, services.AttrDeploymentName },
-	func(a KubernetesService) (string, string) { return a.ReplicaSetName, services.AttrReplicaSetName },
-	func(a KubernetesService) (string, string) { return a.StatefulSetName, services.AttrStatefulSetName },
-	func(a KubernetesService) (string, string) { return a.DaemonSetName, services.AttrDaemonSetName },
-	func(a KubernetesService) (string, string) { return a.OwnerName, services.AttrOwnerName },
-}
-
-// Convert to RegexpAttr
-func convertKubernetes(args KubernetesService) (map[string]*services.RegexpAttr, error) {
-	return convertKubernetesAttributes(args, kubernetesGetters, stringToRegexpAttr)
-}
-
-// Convert to GlobAttr
-func convertKubernetesGlob(args KubernetesService) (map[string]*services.GlobAttr, error) {
-	return convertKubernetesAttributes(args, kubernetesGetters, stringToGlobAttr)
-}
-
-func (args Metrics) Convert() prom.PrometheusConfig {
-	p := beyla.DefaultConfig.Prometheus
-	if args.Features != nil {
-		p.Features = args.Features
-	}
-	if args.Instrumentations != nil {
-		p.Instrumentations = args.Instrumentations
-	}
-	p.AllowServiceGraphSelfReferences = args.AllowServiceGraphSelfReferences
-	if args.ExtraResourceLabels != nil {
-		p.ExtraResourceLabels = args.ExtraResourceLabels
-	}
-	if args.ExtraSpanResourceLabels != nil {
-		p.ExtraSpanResourceLabels = args.ExtraSpanResourceLabels
-	}
-	return p
-}
-
-func (args Metrics) hasNetworkFeature() bool {
-	for _, feature := range args.Features {
-		if feature == "network" {
-			return true
-		}
-	}
-	return false
-}
-
-func (args Metrics) hasAppFeature() bool {
-	for _, feature := range args.Features {
-		switch feature {
-		case "application", "application_host", "application_span", "application_service_graph",
-			"application_process", "application_span_otel", "application_span_sizes":
-			return true
-		}
-	}
-	return false
-}
-
-func (args Metrics) Validate() error {
-	for _, instrumentation := range args.Instrumentations {
-		if _, ok := validInstrumentations[instrumentation]; !ok {
-			return fmt.Errorf("metrics.instrumentations: invalid value %q", instrumentation)
-		}
-	}
-
-	validFeatures := map[string]struct{}{
-		"application": {}, "application_span": {}, "application_span_otel": {},
-		"application_span_sizes": {}, "application_host": {},
-		"application_service_graph": {}, "application_process": {},
-		"network": {}, "network_inter_zone": {},
-	}
-	for _, feature := range args.Features {
-		if _, ok := validFeatures[feature]; !ok {
-			return fmt.Errorf("metrics.features: invalid value %q", feature)
-		}
-	}
-	return nil
-}
-
-func (args Network) Convert(enable bool) beyla.NetworkConfig {
-	networks := beyla.DefaultConfig.NetworkFlows
-	networks.Enable = enable
-	if args.Source != "" {
-		networks.Source = args.Source
-	}
-	if args.AgentIP != "" {
-		networks.AgentIP = args.AgentIP
-	}
-	if args.AgentIPIface != "" {
-		networks.AgentIPIface = args.AgentIPIface
-	}
-	if args.AgentIPType != "" {
-		networks.AgentIPType = args.AgentIPType
-	}
-	if args.ExcludeInterfaces != nil {
-		networks.ExcludeInterfaces = args.ExcludeInterfaces
-	}
-	if args.CacheMaxFlows != 0 {
-		networks.CacheMaxFlows = args.CacheMaxFlows
-	}
-	if args.CacheActiveTimeout != 0 {
-		networks.CacheActiveTimeout = args.CacheActiveTimeout
-	}
-	if args.Direction != "" {
-		networks.Direction = args.Direction
-	}
-	networks.Interfaces = args.Interfaces
-	networks.Protocols = args.Protocols
-	networks.ExcludeProtocols = args.ExcludeProtocols
-	networks.Sampling = args.Sampling
-	networks.CIDRs = args.CIDRs
-	return networks
-}
-
-func (args EBPF) Convert() (*beylaCfg.EBPFTracer, error) {
-	ebpf := beyla.DefaultConfig.EBPF
-	if args.HTTPRequestTimeout != 0 {
-		ebpf.HTTPRequestTimeout = args.HTTPRequestTimeout
-	}
-
-	if args.ContextPropagation == "" {
-		args.ContextPropagation = "disabled"
-	}
-	var contextPropagationMode beylaCfg.ContextPropagationMode
-	err := contextPropagationMode.UnmarshalText([]byte(args.ContextPropagation))
-	if err != nil {
-		return nil, err
-	}
-	ebpf.ContextPropagation = contextPropagationMode
-
-	ebpf.WakeupLen = args.WakeupLen
-	ebpf.TrackRequestHeaders = args.TrackRequestHeaders
-	ebpf.HighRequestVolume = args.HighRequestVolume
-	ebpf.HeuristicSQLDetect = args.HeuristicSQLDetect
-	ebpf.BpfDebug = args.BpfDebug
-	ebpf.ProtocolDebug = args.ProtocolDebug
-	return &ebpf, nil
-}
-
-func (args Filters) Convert() filter.AttributesConfig {
-	filters := filter.AttributesConfig{
-		Application: map[string]filter.MatchDefinition{},
-		Network:     map[string]filter.MatchDefinition{},
-	}
-	for _, app := range args.Application {
-		filters.Application[app.Attr] = filter.MatchDefinition{
-			Match:    app.Match,
-			NotMatch: app.NotMatch,
-		}
-	}
-	for _, net := range args.Network {
-		filters.Network[net.Attr] = filter.MatchDefinition{
-			Match:    net.Match,
-			NotMatch: net.NotMatch,
-		}
-	}
-	return filters
-}
-
 func New(opts component.Options, args Arguments) (*Component, error) {
 	c := &Component{
 		opts:       opts,
@@ -588,31 +135,6 @@ func New(opts component.Options, args Arguments) (*Component, error) {
 		return nil, err
 	}
 	return c, nil
-}
-
-func (c *Component) loadConfig() (*beyla.Config, error) {
-	c.mut.Lock()
-	defer c.mut.Unlock()
-
-	cfg, err := c.args.Convert()
-	if err != nil {
-		return nil, fmt.Errorf("failed to convert arguments: %w", err)
-	}
-
-	if err := env.Parse(cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse env: %w", err)
-	}
-
-	if cfg.Discovery.SurveyEnabled() {
-		cfg.Discovery.OverrideDefaultExcludeForSurvey()
-	}
-
-	c.reg = prometheus.NewRegistry()
-	c.reportHealthy()
-
-	cfg.Prometheus.Registry = c.reg
-
-	return cfg, nil
 }
 
 // Run implements component.Component.
@@ -646,37 +168,74 @@ func (c *Component) Run(ctx context.Context) error {
 			newArgs = getLatestArgsFromChannel(c.argsUpdate, newArgs)
 			c.args = newArgs
 			if cancel != nil {
-				// cancel any previously running Beyla instance
+				// cancel any previously running Beyla subprocess
 				cancel()
-				level.Info(c.opts.Logger).Log("msg", "waiting for Beyla to terminate")
+				level.Info(c.opts.Logger).Log("msg", "waiting for Beyla subprocess to terminate")
 				if err := cancelG.Wait(); err != nil {
-					level.Error(c.opts.Logger).Log("msg", "Beyla terminated with error", "err", err)
+					level.Error(c.opts.Logger).Log("msg", "Beyla subprocess terminated with error", "err", err)
 					c.reportUnhealthy(err)
 				}
+				// Cleanup previous temp files
+				c.cleanup()
 			}
 
-			level.Info(c.opts.Logger).Log("msg", "starting Beyla component")
+			level.Info(c.opts.Logger).Log("msg", "starting Beyla subprocess")
 
 			newCtx, cancelFunc := context.WithCancel(ctx)
 			cancel = cancelFunc
 
-			cfg, err := c.loadConfig()
+			// Extract embedded Beyla binary
+			exePath, cleanupBinary, err := c.extractBeylaExecutable()
 			if err != nil {
-				level.Error(c.opts.Logger).Log("msg", "failed to load config", "err", err)
+				level.Error(c.opts.Logger).Log("msg", "failed to extract Beyla binary", "err", err)
 				c.reportUnhealthy(err)
 				continue
 			}
 
+			c.mut.Lock()
+			c.beylaExePath = exePath
+			c.cleanupFuncs = append(c.cleanupFuncs, cleanupBinary)
+			c.mut.Unlock()
+
+			// Allocate port for subprocess
+			port, err := findFreePort()
+			if err != nil {
+				level.Error(c.opts.Logger).Log("msg", "failed to allocate port", "err", err)
+				c.reportUnhealthy(err)
+				c.cleanup()
+				continue
+			}
+
+			c.mut.Lock()
+			c.subprocessPort = port
+			c.subprocessAddr = fmt.Sprintf("http://localhost:%d", port)
+			c.mut.Unlock()
+
+			// Write config to temporary file
+			configPath, cleanupConfig, err := c.writeConfigFile()
+			if err != nil {
+				level.Error(c.opts.Logger).Log("msg", "failed to write config", "err", err)
+				c.reportUnhealthy(err)
+				c.cleanup()
+				continue
+			}
+
+			c.mut.Lock()
+			c.configPath = configPath
+			c.cleanupFuncs = append(c.cleanupFuncs, cleanupConfig)
+			c.mut.Unlock()
+
 			g, launchCtx := errgroup.WithContext(newCtx)
 			cancelG = g
 
+			// Start Beyla subprocess
 			g.Go(func() error {
-				err := components.RunBeyla(launchCtx, cfg)
-				if err != nil {
-					level.Error(c.opts.Logger).Log("msg", "failed to run Beyla", "err", err)
-					c.reportUnhealthy(err)
-				}
-				return err
+				return c.runSubprocess(launchCtx)
+			})
+
+			// Start health checker
+			g.Go(func() error {
+				return c.healthCheckLoop(launchCtx)
 			})
 		}
 	}
@@ -753,55 +312,109 @@ func (c *Component) CurrentHealth() component.Health {
 }
 
 func (c *Component) Handler() http.Handler {
-	return promhttp.HandlerFor(c.reg, promhttp.HandlerOpts{})
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c.mut.Lock()
+		addr := c.subprocessAddr
+		c.mut.Unlock()
+
+		if addr == "" {
+			http.Error(w, "Beyla subprocess not started", http.StatusServiceUnavailable)
+			return
+		}
+
+		// Build proxy URL
+		target, err := url.Parse(addr)
+		if err != nil {
+			level.Error(c.opts.Logger).Log("msg", "failed to parse subprocess URL", "err", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
+			return
+		}
+
+		// Create reverse proxy
+		proxy := httputil.NewSingleHostReverseProxy(target)
+
+		// Add error handler
+		proxy.ErrorHandler = func(w http.ResponseWriter, r *http.Request, err error) {
+			level.Error(c.opts.Logger).Log("msg", "proxy error", "err", err)
+			http.Error(w, "subprocess unavailable", http.StatusBadGateway)
+		}
+
+		proxy.ServeHTTP(w, r)
+	})
 }
 
-func (a *Arguments) Convert() (*beyla.Config, error) {
-	var err error
-	cfg := beyla.DefaultConfig
+func (args Metrics) hasNetworkFeature() bool {
+	for _, feature := range args.Features {
+		if feature == "network" {
+			return true
+		}
+	}
+	return false
+}
 
-	if a.Output != nil {
-		cfg.TracesReceiver = a.Traces.Convert(a.Output.Traces)
+func (args Metrics) hasAppFeature() bool {
+	for _, feature := range args.Features {
+		switch feature {
+		case "application", "application_host", "application_span", "application_service_graph",
+			"application_process", "application_span_otel", "application_span_sizes":
+			return true
+		}
+	}
+	return false
+}
+
+func (args Metrics) Validate() error {
+	for _, instrumentation := range args.Instrumentations {
+		if _, ok := validInstrumentations[instrumentation]; !ok {
+			return fmt.Errorf("metrics.instrumentations: invalid value %q", instrumentation)
+		}
 	}
 
-	cfg.Routes = a.Routes.Convert()
-	cfg.Attributes = a.Attributes.Convert()
-	cfg.Discovery, err = a.Discovery.Convert()
-	if err != nil {
-		return nil, err
+	validFeatures := map[string]struct{}{
+		"application": {}, "application_span": {}, "application_span_otel": {},
+		"application_span_sizes": {}, "application_host": {},
+		"application_service_graph": {}, "application_process": {},
+		"network": {}, "network_inter_zone": {},
 	}
-	cfg.Prometheus = a.Metrics.Convert()
-	cfg.NetworkFlows = a.Metrics.Network.Convert(a.Metrics.hasNetworkFeature())
-	cfg.EnforceSysCaps = a.EnforceSysCaps
-
-	ebpf, err := a.EBPF.Convert()
-	if err != nil {
-		return nil, err
+	for _, feature := range args.Features {
+		if _, ok := validFeatures[feature]; !ok {
+			return fmt.Errorf("metrics.features: invalid value %q", feature)
+		}
 	}
-	cfg.EBPF = *ebpf
+	return nil
+}
 
-	cfg.Filters = a.Filters.Convert()
-	cfg.TracePrinter = debug.TracePrinter(a.TracePrinter)
+func (args Services) Validate() error {
+	for i, svc := range args {
+		// Check if any Kubernetes fields are defined
+		hasKubernetes := svc.Kubernetes.Namespace != "" ||
+			svc.Kubernetes.PodName != "" ||
+			svc.Kubernetes.DeploymentName != "" ||
+			svc.Kubernetes.ReplicaSetName != "" ||
+			svc.Kubernetes.StatefulSetName != "" ||
+			svc.Kubernetes.DaemonSetName != "" ||
+			svc.Kubernetes.OwnerName != "" ||
+			len(svc.Kubernetes.PodLabels) > 0
 
-	if a.Debug {
-		// TODO: integrate Beyla internal logging with Alloy global logging
-		lvl := slog.LevelVar{}
-		lvl.Set(slog.LevelDebug)
-		cfg.ExternalLogger(slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
-			Level: &lvl,
-		})).Handler(), a.Debug)
+		if svc.OpenPorts == "" && svc.Path == "" && !hasKubernetes {
+			return fmt.Errorf("discovery.services[%d] must define at least one of: open_ports, exe_path, or kubernetes configuration", i)
+		}
 	}
-
-	return &cfg, nil
+	return nil
 }
 
 func (args *Arguments) Validate() error {
 	hasAppFeature := args.Metrics.hasAppFeature()
 
 	if args.TracePrinter == "" {
-		args.TracePrinter = string(debug.TracePrinterDisabled)
-	} else if !debug.TracePrinter(args.TracePrinter).Valid() {
-		return fmt.Errorf("trace_printer: invalid value %q. Valid values are: disabled, counter, text, json, json_indent", args.TracePrinter)
+		args.TracePrinter = "disabled"
+	} else {
+		validPrinters := map[string]bool{
+			"disabled": true, "counter": true, "text": true, "json": true, "json_indent": true,
+		}
+		if !validPrinters[args.TracePrinter] {
+			return fmt.Errorf("trace_printer: invalid value %q. Valid values are: disabled, counter, text, json, json_indent", args.TracePrinter)
+		}
 	}
 
 	if err := args.Metrics.Validate(); err != nil {
@@ -896,30 +509,6 @@ func (args *Arguments) Validate() error {
 	return nil
 }
 
-func (args Traces) Convert(consumers []otelcol.Consumer) beyla.TracesReceiverConfig {
-	// Convert the OTEL consumers
-	convertedConsumers := make([]beyla.Consumer, len(consumers))
-	for i, trace := range consumers {
-		convertedConsumers[i] = trace
-	}
-
-	config := beyla.TracesReceiverConfig{
-		Traces: convertedConsumers,
-	}
-
-	if len(args.Instrumentations) == 0 {
-		config.Instrumentations = []string{
-			instrumentations.InstrumentationALL,
-		}
-	} else {
-		config.Instrumentations = args.Instrumentations
-	}
-	if args.Sampler.Name != "" || args.Sampler.Arg != "" {
-		config.Sampler = args.Sampler.Convert()
-	}
-	return config
-}
-
 func (args Traces) Validate() error {
 	for _, instrumentation := range args.Instrumentations {
 		if _, ok := validInstrumentations[instrumentation]; !ok {
@@ -935,40 +524,6 @@ func (args Traces) Validate() error {
 	return nil
 }
 
-func stringToRegexpAttr(s string) (services.RegexpAttr, error) {
-	var attr services.RegexpAttr
-	if err := attr.UnmarshalText([]byte(s)); err != nil {
-		return services.RegexpAttr{}, err
-	}
-	return attr, nil
-}
-
-func stringToGlobAttr(s string) (services.GlobAttr, error) {
-	if s == "" {
-		return services.GlobAttr{}, nil
-	}
-
-	globAttr := services.GlobAttr{}
-	err := globAttr.UnmarshalText([]byte(s))
-
-	if err != nil {
-		return services.GlobAttr{}, err
-	}
-	return globAttr, nil
-}
-
-func stringToPortEnum(s string) (services.PortEnum, error) {
-	if s == "" {
-		return services.PortEnum{}, nil
-	}
-	p := services.PortEnum{}
-	err := p.UnmarshalText([]byte(s))
-	if err != nil {
-		return services.PortEnum{}, err
-	}
-	return p, nil
-}
-
 func defaultInstance() string {
 	hostname := os.Getenv("HOSTNAME")
 	if hostname != "" {
@@ -980,4 +535,611 @@ func defaultInstance() string {
 		return "unknown"
 	}
 	return hostname
+}
+
+// cleanup runs all cleanup functions
+func (c *Component) cleanup() {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
+	for _, cleanupFunc := range c.cleanupFuncs {
+		cleanupFunc()
+	}
+	c.cleanupFuncs = nil
+	c.beylaExePath = ""
+	c.configPath = ""
+}
+
+// extractBeylaExecutable extracts the embedded Beyla binary to a temporary location
+func (c *Component) extractBeylaExecutable() (string, func(), error) {
+	tmpDir, err := os.MkdirTemp("", "alloy-beyla-*")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create temp directory: %w", err)
+	}
+
+	if err := os.Chmod(tmpDir, 0700); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("failed to set directory permissions: %w", err)
+	}
+
+	binPath := filepath.Join(tmpDir, "beyla")
+
+	if err := os.WriteFile(binPath, beylaEmbeddedBinary, 0755); err != nil {
+		os.RemoveAll(tmpDir)
+		return "", nil, fmt.Errorf("failed to write binary: %w", err)
+	}
+
+	level.Debug(c.opts.Logger).Log("msg", "extracted Beyla binary", "path", binPath, "size", len(beylaEmbeddedBinary))
+
+	cleanup := func() {
+		level.Debug(c.opts.Logger).Log("msg", "cleaning up Beyla binary", "path", binPath)
+		os.RemoveAll(tmpDir)
+	}
+
+	return binPath, cleanup, nil
+}
+
+// writeConfigFile writes the Beyla config to a temporary file
+// This generates YAML directly from Arguments without using Beyla's config types
+func (c *Component) writeConfigFile() (string, func(), error) {
+	config := make(map[string]interface{})
+
+	// Build YAML structure directly from c.args
+	c.mut.Lock()
+	port := c.subprocessPort
+	c.mut.Unlock()
+
+	// Prometheus configuration
+	prometheus := map[string]interface{}{
+		"port": port,
+	}
+	if len(c.args.Metrics.Features) > 0 {
+		prometheus["features"] = c.args.Metrics.Features
+	}
+	if len(c.args.Metrics.Instrumentations) > 0 {
+		prometheus["instrumentations"] = c.args.Metrics.Instrumentations
+	}
+	if c.args.Metrics.AllowServiceGraphSelfReferences {
+		prometheus["allow_service_graph_self_references"] = true
+	}
+	if len(c.args.Metrics.ExtraResourceLabels) > 0 {
+		prometheus["extra_resource_labels"] = c.args.Metrics.ExtraResourceLabels
+	}
+	if len(c.args.Metrics.ExtraSpanResourceLabels) > 0 {
+		prometheus["extra_span_resource_labels"] = c.args.Metrics.ExtraSpanResourceLabels
+	}
+	config["prometheus_export"] = prometheus
+
+	// Routes configuration
+	if c.args.Routes.Unmatch != "" || len(c.args.Routes.Patterns) > 0 || len(c.args.Routes.IgnorePatterns) > 0 {
+		routes := make(map[string]interface{})
+		if c.args.Routes.Unmatch != "" {
+			routes["unmatched"] = c.args.Routes.Unmatch
+		}
+		if len(c.args.Routes.Patterns) > 0 {
+			routes["patterns"] = c.args.Routes.Patterns
+		}
+		if len(c.args.Routes.IgnorePatterns) > 0 {
+			routes["ignored_patterns"] = c.args.Routes.IgnorePatterns
+		}
+		if c.args.Routes.IgnoredEvents != "" {
+			routes["ignore_mode"] = c.args.Routes.IgnoredEvents
+		}
+		if c.args.Routes.WildcardChar != "" {
+			routes["wildcard"] = c.args.Routes.WildcardChar
+		}
+		config["routes"] = routes
+	}
+
+	// Attributes configuration
+	if c.args.Attributes.Kubernetes.Enable != "" || c.args.Attributes.InstanceID.OverrideHostname != "" || len(c.args.Attributes.Select) > 0 {
+		attributes := make(map[string]interface{})
+
+		// Kubernetes attributes
+		if c.args.Attributes.Kubernetes.Enable != "" {
+			kubernetes := map[string]interface{}{
+				"enable": c.args.Attributes.Kubernetes.Enable,
+			}
+			if c.args.Attributes.Kubernetes.ClusterName != "" {
+				kubernetes["cluster_name"] = c.args.Attributes.Kubernetes.ClusterName
+			}
+			if c.args.Attributes.Kubernetes.InformersSyncTimeout != 0 {
+				kubernetes["informers_sync_timeout"] = c.args.Attributes.Kubernetes.InformersSyncTimeout.String()
+			}
+			if c.args.Attributes.Kubernetes.InformersResyncPeriod != 0 {
+				kubernetes["informers_resync_period"] = c.args.Attributes.Kubernetes.InformersResyncPeriod.String()
+			}
+			if len(c.args.Attributes.Kubernetes.DisableInformers) > 0 {
+				kubernetes["disable_informers"] = c.args.Attributes.Kubernetes.DisableInformers
+			}
+			if c.args.Attributes.Kubernetes.MetaRestrictLocalNode {
+				kubernetes["meta_restrict_local_node"] = true
+			}
+			if c.args.Attributes.Kubernetes.MetaCacheAddress != "" {
+				kubernetes["meta_cache_address"] = c.args.Attributes.Kubernetes.MetaCacheAddress
+			}
+			attributes["kubernetes"] = kubernetes
+		}
+
+		// InstanceID attributes
+		if c.args.Attributes.InstanceID.HostnameDNSResolution || c.args.Attributes.InstanceID.OverrideHostname != "" {
+			instanceID := make(map[string]interface{})
+			if c.args.Attributes.InstanceID.HostnameDNSResolution {
+				instanceID["dns"] = true
+			}
+			if c.args.Attributes.InstanceID.OverrideHostname != "" {
+				instanceID["override_hostname"] = c.args.Attributes.InstanceID.OverrideHostname
+			}
+			attributes["instance_id"] = instanceID
+		}
+
+		// Select attributes
+		if len(c.args.Attributes.Select) > 0 {
+			selectMap := make(map[string]interface{})
+			for _, sel := range c.args.Attributes.Select {
+				selConfig := make(map[string]interface{})
+				if len(sel.Include) > 0 {
+					selConfig["include"] = sel.Include
+				}
+				if len(sel.Exclude) > 0 {
+					selConfig["exclude"] = sel.Exclude
+				}
+				if len(selConfig) > 0 {
+					selectMap[sel.Section] = selConfig
+				}
+			}
+			if len(selectMap) > 0 {
+				attributes["select"] = selectMap
+			}
+		}
+
+		config["attributes"] = attributes
+	}
+
+	// Discovery configuration
+	discovery := make(map[string]interface{})
+
+	// Legacy services (deprecated)
+	if len(c.args.Discovery.Services) > 0 {
+		discovery["services"] = buildServicesYAML(c.args.Discovery.Services)
+	}
+	if len(c.args.Discovery.ExcludeServices) > 0 {
+		discovery["exclude_services"] = buildServicesYAML(c.args.Discovery.ExcludeServices)
+	}
+	if len(c.args.Discovery.DefaultExcludeServices) > 0 {
+		discovery["default_exclude_services"] = buildServicesYAML(c.args.Discovery.DefaultExcludeServices)
+	}
+
+	// New discovery fields
+	if len(c.args.Discovery.Survey) > 0 {
+		discovery["survey"] = buildServicesYAML(c.args.Discovery.Survey)
+	}
+	if len(c.args.Discovery.Instrument) > 0 {
+		discovery["instrument"] = buildServicesYAML(c.args.Discovery.Instrument)
+	}
+	if len(c.args.Discovery.ExcludeInstrument) > 0 {
+		discovery["exclude_instrument"] = buildServicesYAML(c.args.Discovery.ExcludeInstrument)
+	}
+	if len(c.args.Discovery.DefaultExcludeInstrument) > 0 {
+		discovery["default_exclude_instrument"] = buildServicesYAML(c.args.Discovery.DefaultExcludeInstrument)
+	}
+
+	if c.args.Discovery.SkipGoSpecificTracers {
+		discovery["skip_go_specific_tracers"] = true
+	}
+	if c.args.Discovery.ExcludeOTelInstrumentedServices {
+		discovery["exclude_otel_instrumented_services"] = true
+	}
+
+	if len(discovery) > 0 {
+		config["discovery"] = discovery
+	}
+
+	// EBPF configuration
+	ebpf := make(map[string]interface{})
+	if c.args.EBPF.HTTPRequestTimeout != 0 {
+		ebpf["http_request_timeout"] = c.args.EBPF.HTTPRequestTimeout.String()
+	}
+	if c.args.EBPF.ContextPropagation != "" {
+		ebpf["context_propagation"] = c.args.EBPF.ContextPropagation
+	}
+	if c.args.EBPF.WakeupLen != 0 {
+		ebpf["wakeup_len"] = c.args.EBPF.WakeupLen
+	}
+	if c.args.EBPF.TrackRequestHeaders {
+		ebpf["track_request_headers"] = true
+	}
+	if c.args.EBPF.HighRequestVolume {
+		ebpf["high_request_volume"] = true
+	}
+	if c.args.EBPF.HeuristicSQLDetect {
+		ebpf["heuristic_sql_detect"] = true
+	}
+	if c.args.EBPF.BpfDebug {
+		ebpf["bpf_debug"] = true
+	}
+	if c.args.EBPF.ProtocolDebug {
+		ebpf["protocol_debug"] = true
+	}
+	if len(ebpf) > 0 {
+		config["ebpf"] = ebpf
+	}
+
+	// Network flows configuration
+	if c.args.Metrics.hasNetworkFeature() || c.args.Metrics.Network.Enable {
+		networkFlows := map[string]interface{}{
+			"enable": true,
+		}
+		if c.args.Metrics.Network.Source != "" {
+			networkFlows["source"] = c.args.Metrics.Network.Source
+		}
+		if c.args.Metrics.Network.AgentIP != "" {
+			networkFlows["agent_ip"] = c.args.Metrics.Network.AgentIP
+		}
+		if c.args.Metrics.Network.AgentIPIface != "" {
+			networkFlows["agent_ip_iface"] = c.args.Metrics.Network.AgentIPIface
+		}
+		if c.args.Metrics.Network.AgentIPType != "" {
+			networkFlows["agent_ip_type"] = c.args.Metrics.Network.AgentIPType
+		}
+		if len(c.args.Metrics.Network.Interfaces) > 0 {
+			networkFlows["interfaces"] = c.args.Metrics.Network.Interfaces
+		}
+		if len(c.args.Metrics.Network.ExcludeInterfaces) > 0 {
+			networkFlows["exclude_interfaces"] = c.args.Metrics.Network.ExcludeInterfaces
+		}
+		if len(c.args.Metrics.Network.Protocols) > 0 {
+			networkFlows["protocols"] = c.args.Metrics.Network.Protocols
+		}
+		if len(c.args.Metrics.Network.ExcludeProtocols) > 0 {
+			networkFlows["exclude_protocols"] = c.args.Metrics.Network.ExcludeProtocols
+		}
+		if c.args.Metrics.Network.CacheMaxFlows != 0 {
+			networkFlows["cache_max_flows"] = c.args.Metrics.Network.CacheMaxFlows
+		}
+		if c.args.Metrics.Network.CacheActiveTimeout != 0 {
+			networkFlows["cache_active_timeout"] = c.args.Metrics.Network.CacheActiveTimeout.String()
+		}
+		if c.args.Metrics.Network.Direction != "" {
+			networkFlows["direction"] = c.args.Metrics.Network.Direction
+		}
+		if c.args.Metrics.Network.Sampling != 0 {
+			networkFlows["sampling"] = c.args.Metrics.Network.Sampling
+		}
+		if len(c.args.Metrics.Network.CIDRs) > 0 {
+			networkFlows["cidrs"] = c.args.Metrics.Network.CIDRs
+		}
+		config["network_flows"] = networkFlows
+	}
+
+	// Filters configuration
+	if len(c.args.Filters.Application) > 0 || len(c.args.Filters.Network) > 0 {
+		filters := make(map[string]interface{})
+		if len(c.args.Filters.Application) > 0 {
+			appFilters := make(map[string]interface{})
+			for _, filter := range c.args.Filters.Application {
+				filterDef := make(map[string]interface{})
+				if filter.Match != "" {
+					filterDef["match"] = filter.Match
+				}
+				if filter.NotMatch != "" {
+					filterDef["not_match"] = filter.NotMatch
+				}
+				if len(filterDef) > 0 {
+					appFilters[filter.Attr] = filterDef
+				}
+			}
+			if len(appFilters) > 0 {
+				filters["application"] = appFilters
+			}
+		}
+		if len(c.args.Filters.Network) > 0 {
+			netFilters := make(map[string]interface{})
+			for _, filter := range c.args.Filters.Network {
+				filterDef := make(map[string]interface{})
+				if filter.Match != "" {
+					filterDef["match"] = filter.Match
+				}
+				if filter.NotMatch != "" {
+					filterDef["not_match"] = filter.NotMatch
+				}
+				if len(filterDef) > 0 {
+					netFilters[filter.Attr] = filterDef
+				}
+			}
+			if len(netFilters) > 0 {
+				filters["network"] = netFilters
+			}
+		}
+		if len(filters) > 0 {
+			config["filters"] = filters
+		}
+	}
+
+	// Traces configuration (only if output is defined)
+	if c.args.Output != nil && (len(c.args.Traces.Instrumentations) > 0 || c.args.Traces.Sampler.Name != "") {
+		traces := make(map[string]interface{})
+		if len(c.args.Traces.Instrumentations) > 0 {
+			traces["instrumentations"] = c.args.Traces.Instrumentations
+		}
+		if c.args.Traces.Sampler.Name != "" {
+			sampler := map[string]interface{}{
+				"name": c.args.Traces.Sampler.Name,
+			}
+			if c.args.Traces.Sampler.Arg != "" {
+				sampler["arg"] = c.args.Traces.Sampler.Arg
+			}
+			traces["sampler"] = sampler
+		}
+		if len(traces) > 0 {
+			config["traces"] = traces
+		}
+	}
+
+	// TracePrinter configuration
+	if c.args.TracePrinter != "" && c.args.TracePrinter != "disabled" {
+		config["trace_printer"] = c.args.TracePrinter
+	}
+
+	// EnforceSysCaps configuration
+	if c.args.EnforceSysCaps {
+		config["enforce_sys_caps"] = true
+	}
+
+	// Serialize config to YAML
+	configData, err := yaml.Marshal(config)
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to marshal config: %w", err)
+	}
+
+	// Log the generated YAML for debugging
+	level.Debug(c.opts.Logger).Log("msg", "generated Beyla YAML config", "yaml", string(configData))
+
+	// Create temporary file
+	tmpFile, err := os.CreateTemp("", "beyla-config-*.yaml")
+	if err != nil {
+		return "", nil, fmt.Errorf("failed to create temp file: %w", err)
+	}
+
+	if _, err := tmpFile.Write(configData); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpFile.Name())
+		return "", nil, fmt.Errorf("failed to write config: %w", err)
+	}
+
+	if err := tmpFile.Close(); err != nil {
+		os.Remove(tmpFile.Name())
+		return "", nil, fmt.Errorf("failed to close temp file: %w", err)
+	}
+
+	cleanup := func() {
+		os.Remove(tmpFile.Name())
+	}
+
+	return tmpFile.Name(), cleanup, nil
+}
+
+// buildServicesYAML builds YAML configuration for services discovery
+func buildServicesYAML(services Services) []map[string]interface{} {
+	result := make([]map[string]interface{}, 0, len(services))
+
+	for _, svc := range services {
+		service := make(map[string]interface{})
+
+		if svc.Name != "" {
+			service["name"] = svc.Name
+		}
+		if svc.Namespace != "" {
+			service["namespace"] = svc.Namespace
+		}
+		if svc.OpenPorts != "" {
+			service["open_ports"] = svc.OpenPorts
+		}
+		if svc.Path != "" {
+			service["exe_path"] = svc.Path
+		}
+		if svc.ContainersOnly {
+			service["containers_only"] = true
+		}
+		if len(svc.ExportModes) > 0 {
+			service["exports"] = svc.ExportModes
+		}
+
+		// Kubernetes metadata
+		k8s := make(map[string]interface{})
+		if svc.Kubernetes.Namespace != "" {
+			k8s["namespace"] = svc.Kubernetes.Namespace
+		}
+		if svc.Kubernetes.PodName != "" {
+			k8s["pod_name"] = svc.Kubernetes.PodName
+		}
+		if svc.Kubernetes.DeploymentName != "" {
+			k8s["deployment_name"] = svc.Kubernetes.DeploymentName
+		}
+		if svc.Kubernetes.ReplicaSetName != "" {
+			k8s["replicaset_name"] = svc.Kubernetes.ReplicaSetName
+		}
+		if svc.Kubernetes.StatefulSetName != "" {
+			k8s["statefulset_name"] = svc.Kubernetes.StatefulSetName
+		}
+		if svc.Kubernetes.DaemonSetName != "" {
+			k8s["daemonset_name"] = svc.Kubernetes.DaemonSetName
+		}
+		if svc.Kubernetes.OwnerName != "" {
+			k8s["owner_name"] = svc.Kubernetes.OwnerName
+		}
+		if len(svc.Kubernetes.PodLabels) > 0 {
+			k8s["pod_labels"] = svc.Kubernetes.PodLabels
+		}
+		if len(svc.Kubernetes.PodAnnotations) > 0 {
+			k8s["pod_annotations"] = svc.Kubernetes.PodAnnotations
+		}
+		if len(k8s) > 0 {
+			service["kubernetes"] = k8s
+		}
+
+		// Sampler configuration
+		if svc.Sampler.Name != "" {
+			sampler := map[string]interface{}{
+				"name": svc.Sampler.Name,
+			}
+			if svc.Sampler.Arg != "" {
+				sampler["arg"] = svc.Sampler.Arg
+			}
+			service["sampler"] = sampler
+		}
+
+		if len(service) > 0 {
+			result = append(result, service)
+		}
+	}
+
+	return result
+}
+
+// findFreePort finds an available TCP port
+func findFreePort() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+
+	addr := listener.Addr().(*net.TCPAddr)
+	return addr.Port, nil
+}
+
+// runSubprocess starts and manages the Beyla subprocess using the extracted binary
+func (c *Component) runSubprocess(ctx context.Context) error {
+	c.mut.Lock()
+	exePath := c.beylaExePath
+	configPath := c.configPath
+	port := c.subprocessPort
+	c.mut.Unlock()
+
+	if exePath == "" {
+		return fmt.Errorf("Beyla executable path not set")
+	}
+
+	if configPath == "" {
+		return fmt.Errorf("config path not set")
+	}
+
+	// Build command using extracted binary
+	cmd := exec.CommandContext(ctx, exePath,
+		"-config", configPath,
+	)
+
+	// Redirect logs to Alloy's logger
+	cmd.Stdout = &logWriter{logger: c.opts.Logger, level: "info"}
+	cmd.Stderr = &logWriter{logger: c.opts.Logger, level: "error"}
+
+	// Set working directory to temp dir
+	cmd.Dir = filepath.Dir(exePath)
+
+	c.mut.Lock()
+	c.subprocessCmd = cmd
+	c.mut.Unlock()
+
+	level.Info(c.opts.Logger).Log(
+		"msg", "starting Beyla subprocess",
+		"binary", exePath,
+		"port", port,
+		"config", configPath,
+	)
+
+	if err := cmd.Start(); err != nil {
+		level.Error(c.opts.Logger).Log("msg", "failed to start Beyla subprocess", "err", err)
+		c.reportUnhealthy(err)
+		return fmt.Errorf("failed to start subprocess: %w", err)
+	}
+
+	level.Info(c.opts.Logger).Log(
+		"msg", "Beyla subprocess started",
+		"pid", cmd.Process.Pid,
+		"binary_size", len(beylaEmbeddedBinary),
+	)
+
+	// Wait for subprocess to exit
+	err := cmd.Wait()
+
+	if err != nil && ctx.Err() == nil {
+		// Subprocess exited unexpectedly (not due to context cancellation)
+		level.Error(c.opts.Logger).Log("msg", "Beyla subprocess exited unexpectedly", "err", err)
+		c.reportUnhealthy(err)
+		return err
+	}
+
+	level.Info(c.opts.Logger).Log("msg", "Beyla subprocess stopped")
+	return nil
+}
+
+// healthCheckLoop periodically checks if the subprocess is healthy
+func (c *Component) healthCheckLoop(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	// Initial wait for subprocess to start
+	time.Sleep(2 * time.Second)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-ticker.C:
+			if err := c.checkSubprocessHealth(); err != nil {
+				level.Warn(c.opts.Logger).Log("msg", "subprocess health check failed", "err", err)
+				c.reportUnhealthy(err)
+			} else {
+				c.reportHealthy()
+			}
+		}
+	}
+}
+
+// checkSubprocessHealth checks if the subprocess is responding
+func (c *Component) checkSubprocessHealth() error {
+	c.mut.Lock()
+	addr := c.subprocessAddr
+	c.mut.Unlock()
+
+	if addr == "" {
+		return fmt.Errorf("subprocess not started")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, "GET", addr+"/metrics", nil)
+	if err != nil {
+		return err
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("subprocess not responding: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("subprocess returned status %d", resp.StatusCode)
+	}
+
+	return nil
+}
+
+// logWriter adapts io.Writer to Alloy's logger
+type logWriter struct {
+	logger log.Logger
+	level  string
+}
+
+func (w *logWriter) Write(p []byte) (n int, err error) {
+	msg := strings.TrimSuffix(string(p), "\n")
+	if w.level == "error" {
+		level.Error(w.logger).Log("msg", msg, "source", "beyla-subprocess")
+	} else {
+		level.Info(w.logger).Log("msg", msg, "source", "beyla-subprocess")
+	}
+	return len(p), nil
 }
