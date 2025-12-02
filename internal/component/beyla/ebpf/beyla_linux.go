@@ -5,6 +5,7 @@ package beyla
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/prometheus/common/model"
+	"go.opentelemetry.io/collector/pdata/ptrace/ptraceotlp"
 	"golang.org/x/sync/errgroup" //nolint:depguard
 	"gopkg.in/yaml.v3"
 
@@ -65,6 +67,15 @@ type Component struct {
 	beylaExePath   string    // Path to extracted Beyla binary
 	configPath     string    // Path to config file
 	cleanupFuncs   []func()  // Cleanup functions for temp files
+
+	// OTLP receiver for traces (when Output is configured)
+	otlpReceiverPort int         // Port where OTLP receiver listens for traces from Beyla
+	otlpServer       *http.Server // HTTP server for OTLP receiver
+
+	// Restart tracking
+	restartCount    int
+	lastRestartTime time.Time
+	restartBackoff  time.Duration
 
 	healthMut sync.RWMutex
 	health    component.Health
@@ -158,12 +169,37 @@ func (c *Component) Run(ctx context.Context) error {
 		level.Warn(c.opts.Logger).Log("msg", "discovery.default_exclude_services is deprecated, use discovery.default_exclude_instrument instead")
 	}
 
+	// Initialize restart backoff
+	c.mut.Lock()
+	c.restartBackoff = 1 * time.Second
+	c.mut.Unlock()
+
+	// Drain any pending args updates from initialization
+	// This prevents race conditions where multiple updates arrive before subprocess starts
+	select {
+	case latestArgs := <-c.argsUpdate:
+		// Get all pending updates
+		latestArgs = getLatestArgsFromChannel(c.argsUpdate, latestArgs)
+		c.mut.Lock()
+		c.args = latestArgs
+		c.mut.Unlock()
+	default:
+		// No pending updates
+	}
+
 	var cancel context.CancelFunc
 	var cancelG *errgroup.Group
+	restartTimer := time.NewTimer(0) // Start immediately
+	defer restartTimer.Stop()
+
 	for {
 		select {
 		case <-ctx.Done():
+			if cancel != nil {
+				cancel()
+			}
 			return nil
+
 		case newArgs := <-c.argsUpdate:
 			newArgs = getLatestArgsFromChannel(c.argsUpdate, newArgs)
 			c.args = newArgs
@@ -178,8 +214,37 @@ func (c *Component) Run(ctx context.Context) error {
 				// Cleanup previous temp files
 				c.cleanup()
 			}
+			// Reset restart tracking on config change
+			c.mut.Lock()
+			c.restartCount = 0
+			c.restartBackoff = 1 * time.Second
+			c.mut.Unlock()
+			// Trigger immediate restart with new config
+			restartTimer.Reset(0)
 
-			level.Info(c.opts.Logger).Log("msg", "starting Beyla subprocess")
+		case <-restartTimer.C:
+			// Start or restart subprocess
+			if cancel != nil {
+				// This is a restart - wait for previous subprocess to stop
+				cancel()
+				level.Info(c.opts.Logger).Log("msg", "waiting for Beyla subprocess to terminate before restart")
+				if err := cancelG.Wait(); err != nil {
+					level.Error(c.opts.Logger).Log("msg", "Beyla subprocess terminated with error", "err", err)
+				}
+				c.cleanup()
+			}
+
+			c.mut.Lock()
+			restartCount := c.restartCount
+			c.restartCount++
+			c.lastRestartTime = time.Now()
+			c.mut.Unlock()
+
+			if restartCount > 0 {
+				level.Info(c.opts.Logger).Log("msg", "restarting Beyla subprocess", "restart_count", restartCount)
+			} else {
+				level.Info(c.opts.Logger).Log("msg", "starting Beyla subprocess")
+			}
 
 			newCtx, cancelFunc := context.WithCancel(ctx)
 			cancel = cancelFunc
@@ -189,6 +254,7 @@ func (c *Component) Run(ctx context.Context) error {
 			if err != nil {
 				level.Error(c.opts.Logger).Log("msg", "failed to extract Beyla binary", "err", err)
 				c.reportUnhealthy(err)
+				c.scheduleRestart(restartTimer)
 				continue
 			}
 
@@ -197,12 +263,22 @@ func (c *Component) Run(ctx context.Context) error {
 			c.cleanupFuncs = append(c.cleanupFuncs, cleanupBinary)
 			c.mut.Unlock()
 
+			// Start OTLP receiver if trace output is configured
+			if err := c.startOTLPReceiver(newCtx); err != nil {
+				level.Error(c.opts.Logger).Log("msg", "failed to start OTLP receiver", "err", err)
+				c.reportUnhealthy(err)
+				c.cleanup()
+				c.scheduleRestart(restartTimer)
+				continue
+			}
+
 			// Allocate port for subprocess
 			port, err := findFreePort()
 			if err != nil {
 				level.Error(c.opts.Logger).Log("msg", "failed to allocate port", "err", err)
 				c.reportUnhealthy(err)
 				c.cleanup()
+				c.scheduleRestart(restartTimer)
 				continue
 			}
 
@@ -217,6 +293,7 @@ func (c *Component) Run(ctx context.Context) error {
 				level.Error(c.opts.Logger).Log("msg", "failed to write config", "err", err)
 				c.reportUnhealthy(err)
 				c.cleanup()
+				c.scheduleRestart(restartTimer)
 				continue
 			}
 
@@ -237,8 +314,35 @@ func (c *Component) Run(ctx context.Context) error {
 			g.Go(func() error {
 				return c.healthCheckLoop(launchCtx)
 			})
+
+			// Monitor subprocess in background
+			go func() {
+				err := g.Wait()
+				// Only restart if context is not cancelled (not a graceful shutdown)
+				if ctx.Err() == nil && err != nil {
+					level.Error(c.opts.Logger).Log("msg", "Beyla subprocess crashed, scheduling restart", "err", err)
+					c.reportUnhealthy(err)
+					c.scheduleRestart(restartTimer)
+				}
+			}()
 		}
 	}
+}
+
+// scheduleRestart schedules a subprocess restart with exponential backoff
+func (c *Component) scheduleRestart(timer *time.Timer) {
+	c.mut.Lock()
+	defer c.mut.Unlock()
+
+	// Exponential backoff: 1s, 2s, 4s, 8s, 16s, 30s (max)
+	backoff := c.restartBackoff
+	c.restartBackoff = c.restartBackoff * 2
+	if c.restartBackoff > 30*time.Second {
+		c.restartBackoff = 30 * time.Second
+	}
+
+	level.Info(c.opts.Logger).Log("msg", "scheduling subprocess restart", "backoff", backoff, "restart_count", c.restartCount)
+	timer.Reset(backoff)
 }
 
 func getLatestArgsFromChannel[A any](ch chan A, current A) A {
@@ -539,6 +643,9 @@ func defaultInstance() string {
 
 // cleanup runs all cleanup functions
 func (c *Component) cleanup() {
+	// Stop OTLP receiver first (doesn't need lock)
+	c.stopOTLPReceiver()
+
 	c.mut.Lock()
 	defer c.mut.Unlock()
 
@@ -548,6 +655,7 @@ func (c *Component) cleanup() {
 	c.cleanupFuncs = nil
 	c.beylaExePath = ""
 	c.configPath = ""
+	c.otlpReceiverPort = 0
 }
 
 // extractBeylaExecutable extracts the embedded Beyla binary to a temporary location
@@ -876,6 +984,22 @@ func (c *Component) writeConfigFile() (string, func(), error) {
 		}
 	}
 
+	// OTLP traces export configuration (when Output consumer is configured)
+	if c.args.Output != nil && len(c.args.Output.Traces) > 0 {
+		c.mut.Lock()
+		otlpPort := c.otlpReceiverPort
+		c.mut.Unlock()
+
+		if otlpPort > 0 {
+			otelTracesExport := map[string]interface{}{
+				"endpoint": fmt.Sprintf("http://localhost:%d", otlpPort),
+				"protocol": "http/protobuf",
+			}
+			config["otel_traces_export"] = otelTracesExport
+			level.Debug(c.opts.Logger).Log("msg", "configured OTLP traces export", "endpoint", fmt.Sprintf("http://localhost:%d", otlpPort))
+		}
+	}
+
 	// TracePrinter configuration
 	if c.args.TracePrinter != "" && c.args.TracePrinter != "disabled" {
 		config["trace_printer"] = c.args.TracePrinter
@@ -1082,6 +1206,9 @@ func (c *Component) healthCheckLoop(ctx context.Context) error {
 	// Initial wait for subprocess to start
 	time.Sleep(2 * time.Second)
 
+	consecutiveSuccesses := 0
+	const successesNeededToResetBackoff = 3
+
 	for {
 		select {
 		case <-ctx.Done():
@@ -1090,8 +1217,22 @@ func (c *Component) healthCheckLoop(ctx context.Context) error {
 			if err := c.checkSubprocessHealth(); err != nil {
 				level.Warn(c.opts.Logger).Log("msg", "subprocess health check failed", "err", err)
 				c.reportUnhealthy(err)
+				consecutiveSuccesses = 0
 			} else {
 				c.reportHealthy()
+				consecutiveSuccesses++
+
+				// Reset backoff after successful health checks
+				if consecutiveSuccesses >= successesNeededToResetBackoff {
+					c.mut.Lock()
+					if c.restartBackoff > 1*time.Second {
+						level.Debug(c.opts.Logger).Log("msg", "resetting restart backoff after successful health checks")
+						c.restartBackoff = 1 * time.Second
+						c.restartCount = 0
+					}
+					c.mut.Unlock()
+					consecutiveSuccesses = 0 // Reset counter
+				}
 			}
 		}
 	}
@@ -1142,4 +1283,122 @@ func (w *logWriter) Write(p []byte) (n int, err error) {
 		level.Info(w.logger).Log("msg", msg, "source", "beyla-subprocess")
 	}
 	return len(p), nil
+}
+
+// startOTLPReceiver starts an HTTP server to receive OTLP traces from Beyla subprocess
+// and forwards them to the configured Output consumer
+func (c *Component) startOTLPReceiver(ctx context.Context) error {
+	if c.args.Output == nil || len(c.args.Output.Traces) == 0 {
+		// No trace output configured, skip OTLP receiver
+		return nil
+	}
+
+	// Allocate port for OTLP receiver
+	port, err := findFreePort()
+	if err != nil {
+		return fmt.Errorf("failed to allocate OTLP receiver port: %w", err)
+	}
+
+	c.mut.Lock()
+	c.otlpReceiverPort = port
+	c.mut.Unlock()
+
+	level.Info(c.opts.Logger).Log("msg", "starting OTLP receiver for traces", "port", port)
+
+	// Create HTTP handler for OTLP traces
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/traces", c.handleOTLPTraces)
+
+	server := &http.Server{
+		Addr:    fmt.Sprintf("127.0.0.1:%d", port),
+		Handler: mux,
+	}
+
+	c.mut.Lock()
+	c.otlpServer = server
+	c.mut.Unlock()
+
+	// Start server in background
+	go func() {
+		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+			level.Error(c.opts.Logger).Log("msg", "OTLP receiver server error", "err", err)
+		}
+	}()
+
+	return nil
+}
+
+// stopOTLPReceiver stops the OTLP receiver server
+func (c *Component) stopOTLPReceiver() {
+	c.mut.Lock()
+	server := c.otlpServer
+	c.otlpServer = nil
+	c.mut.Unlock()
+
+	if server != nil {
+		level.Debug(c.opts.Logger).Log("msg", "stopping OTLP receiver")
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := server.Shutdown(ctx); err != nil {
+			level.Warn(c.opts.Logger).Log("msg", "error shutting down OTLP receiver", "err", err)
+		}
+	}
+}
+
+// handleOTLPTraces handles incoming OTLP/HTTP trace requests from Beyla
+func (c *Component) handleOTLPTraces(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Read request body
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		level.Error(c.opts.Logger).Log("msg", "failed to read OTLP request body", "err", err)
+		http.Error(w, "failed to read request", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	// Parse OTLP request
+	req := ptraceotlp.NewExportRequest()
+
+	// Determine content type and unmarshal accordingly
+	contentType := r.Header.Get("Content-Type")
+	if strings.Contains(contentType, "application/json") {
+		err = req.UnmarshalJSON(body)
+	} else {
+		// Default to protobuf
+		err = req.UnmarshalProto(body)
+	}
+
+	if err != nil {
+		level.Error(c.opts.Logger).Log("msg", "failed to unmarshal OTLP traces", "err", err)
+		http.Error(w, "failed to parse OTLP request", http.StatusBadRequest)
+		return
+	}
+
+	// Get traces from request
+	traces := req.Traces()
+
+	// Forward to all configured trace consumers
+	c.mut.Lock()
+	consumers := c.args.Output.Traces
+	c.mut.Unlock()
+
+	// Send to each consumer
+	for _, consumer := range consumers {
+		if err := consumer.ConsumeTraces(r.Context(), traces); err != nil {
+			level.Error(c.opts.Logger).Log("msg", "failed to forward traces to consumer", "err", err)
+			http.Error(w, "failed to process traces", http.StatusInternalServerError)
+			return
+		}
+	}
+
+	// Send success response
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	// OTLP spec requires empty JSON object on success
+	w.Write([]byte("{}"))
 }
