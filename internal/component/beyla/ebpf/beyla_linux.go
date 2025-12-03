@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/go-kit/log"
@@ -521,6 +522,12 @@ func (c *Component) runSubprocess(ctx context.Context) error {
 	cmd := exec.CommandContext(ctx, exePath,
 		"-config", configPath,
 	)
+
+	// Ensure Beyla subprocess gets killed when Alloy dies (even with SIGKILL)
+	// PR_SET_PDEATHSIG sends SIGKILL to child when parent terminates
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Pdeathsig: syscall.SIGKILL,
+	}
 
 	// Redirect logs to Alloy's logger
 	cmd.Stdout = &logWriter{logger: c.opts.Logger, level: "info"}
