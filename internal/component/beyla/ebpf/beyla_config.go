@@ -59,12 +59,13 @@ func (c *Component) buildConfig() map[string]interface{} {
 	c.addAttributesConfig(config)
 	c.addDiscoveryConfig(config)
 	c.addEBPFConfig(config)
-	c.addNetworkFlowsConfig(config)
+	c.addNetworkConfig(config)
 	c.addFiltersConfig(config)
 	c.addTracesConfig(config)
 	c.addOTLPTracesExportConfig(config)
 	c.addTracePrinterConfig(config)
 	c.addEnforceSysCapsConfig(config)
+	c.addTopLevelConfig(config)
 
 	return config
 }
@@ -105,12 +106,14 @@ func (c *Component) addPrometheusConfig(config map[string]interface{}) {
 
 // addRoutesConfig adds route configuration
 // Generates:
-//   routes:
-//     unmatched: "heuristic"
-//     patterns: ["/api/*", "/users/{id}"]
-//     ignored_patterns: ["/health", "/metrics"]
+//
+//	routes:
+//	  unmatched: "heuristic"
+//	  patterns: ["/api/*", "/users/{id}"]
+//	  ignored_patterns: ["/health", "/metrics"]
 func (c *Component) addRoutesConfig(config map[string]interface{}) {
-	if c.args.Routes.Unmatch == "" && len(c.args.Routes.Patterns) == 0 && len(c.args.Routes.IgnorePatterns) == 0 {
+	if c.args.Routes.Unmatch == "" && len(c.args.Routes.Patterns) == 0 && len(c.args.Routes.IgnorePatterns) == 0 &&
+		c.args.Routes.MaxPathSegmentCardinality == 0 {
 		return
 	}
 
@@ -130,6 +133,9 @@ func (c *Component) addRoutesConfig(config map[string]interface{}) {
 	}
 	if c.args.Routes.WildcardChar != "" {
 		routes["wildcard"] = c.args.Routes.WildcardChar
+	}
+	if c.args.Routes.MaxPathSegmentCardinality != 0 {
+		routes["max_path_segment_cardinality"] = c.args.Routes.MaxPathSegmentCardinality
 	}
 
 	config["routes"] = routes
@@ -200,6 +206,15 @@ func (c *Component) buildKubernetesConfig() map[string]interface{} {
 	}
 	if c.args.Attributes.Kubernetes.MetaCacheAddress != "" {
 		kubernetes["meta_cache_address"] = c.args.Attributes.Kubernetes.MetaCacheAddress
+	}
+	if c.args.Attributes.Kubernetes.DropExternal {
+		kubernetes["drop_external"] = true
+	}
+	if len(c.args.Attributes.Kubernetes.ResourceLabels) > 0 {
+		kubernetes["resource_labels"] = c.args.Attributes.Kubernetes.ResourceLabels
+	}
+	if c.args.Attributes.Kubernetes.ServiceNameTemplate != "" {
+		kubernetes["service_name_template"] = c.args.Attributes.Kubernetes.ServiceNameTemplate
 	}
 
 	return kubernetes
@@ -283,6 +298,27 @@ func (c *Component) addDiscoveryConfig(config map[string]interface{}) {
 	if c.args.Discovery.ExcludeOTelInstrumentedServices {
 		discovery["exclude_otel_instrumented_services"] = true
 	}
+	if c.args.Discovery.ExcludeOTelInstrumentedServicesSpanMetrics {
+		discovery["exclude_otel_instrumented_services_span_metrics"] = true
+	}
+	if c.args.Discovery.MinProcessAge != 0 {
+		discovery["min_process_age"] = c.args.Discovery.MinProcessAge.String()
+	}
+	if c.args.Discovery.PollInterval != 0 {
+		discovery["poll_interval"] = c.args.Discovery.PollInterval.String()
+	}
+	if c.args.Discovery.BpfPidFilterOff {
+		discovery["bpf_pid_filter_off"] = true
+	}
+	if c.args.Discovery.RouteHarvesterTimeout != 0 {
+		discovery["route_harvester_timeout"] = c.args.Discovery.RouteHarvesterTimeout.String()
+	}
+	if len(c.args.Discovery.DisabledRouteHarvesters) > 0 {
+		discovery["disabled_route_harvesters"] = c.args.Discovery.DisabledRouteHarvesters
+	}
+	if len(c.args.Discovery.ExcludedLinuxSystemPaths) > 0 {
+		discovery["excluded_linux_system_paths"] = c.args.Discovery.ExcludedLinuxSystemPaths
+	}
 
 	if len(discovery) > 0 {
 		config["discovery"] = discovery
@@ -308,6 +344,12 @@ func buildServicesYAML(services Services) []map[string]interface{} {
 		if svc.Path != "" {
 			service["exe_path"] = svc.Path
 		}
+		if svc.CmdArgs != "" {
+			service["cmd_args"] = svc.CmdArgs
+		}
+		if len(svc.Languages) > 0 {
+			service["languages"] = svc.Languages
+		}
 		if svc.ContainersOnly {
 			service["containers_only"] = true
 		}
@@ -315,10 +357,10 @@ func buildServicesYAML(services Services) []map[string]interface{} {
 			service["exports"] = svc.ExportModes
 		}
 
-		// Kubernetes metadata
-		k8s := buildKubernetesServiceConfig(svc.Kubernetes)
-		if len(k8s) > 0 {
-			service["kubernetes"] = k8s
+		// Kubernetes metadata: merge flat k8s_* fields directly into the entry
+		// (OBI v3 GlobAttributes uses flat k8s_* keys, not a nested kubernetes block)
+		for k, v := range buildKubernetesServiceConfig(svc.Kubernetes) {
+			service[k] = v
 		}
 
 		// Sampler configuration
@@ -345,31 +387,40 @@ func buildKubernetesServiceConfig(k8sService KubernetesService) map[string]inter
 	k8s := make(map[string]interface{})
 
 	if k8sService.Namespace != "" {
-		k8s["namespace"] = k8sService.Namespace
+		k8s["k8s_namespace"] = k8sService.Namespace
 	}
 	if k8sService.PodName != "" {
-		k8s["pod_name"] = k8sService.PodName
+		k8s["k8s_pod_name"] = k8sService.PodName
 	}
 	if k8sService.DeploymentName != "" {
-		k8s["deployment_name"] = k8sService.DeploymentName
+		k8s["k8s_deployment_name"] = k8sService.DeploymentName
 	}
 	if k8sService.ReplicaSetName != "" {
-		k8s["replicaset_name"] = k8sService.ReplicaSetName
+		k8s["k8s_replicaset_name"] = k8sService.ReplicaSetName
 	}
 	if k8sService.StatefulSetName != "" {
-		k8s["statefulset_name"] = k8sService.StatefulSetName
+		k8s["k8s_statefulset_name"] = k8sService.StatefulSetName
 	}
 	if k8sService.DaemonSetName != "" {
-		k8s["daemonset_name"] = k8sService.DaemonSetName
+		k8s["k8s_daemonset_name"] = k8sService.DaemonSetName
+	}
+	if k8sService.CronjobName != "" {
+		k8s["k8s_cronjob_name"] = k8sService.CronjobName
+	}
+	if k8sService.JobName != "" {
+		k8s["k8s_job_name"] = k8sService.JobName
+	}
+	if k8sService.ContainerName != "" {
+		k8s["k8s_container_name"] = k8sService.ContainerName
 	}
 	if k8sService.OwnerName != "" {
-		k8s["owner_name"] = k8sService.OwnerName
+		k8s["k8s_owner_name"] = k8sService.OwnerName
 	}
 	if len(k8sService.PodLabels) > 0 {
-		k8s["pod_labels"] = k8sService.PodLabels
+		k8s["k8s_pod_labels"] = k8sService.PodLabels
 	}
 	if len(k8sService.PodAnnotations) > 0 {
-		k8s["pod_annotations"] = k8sService.PodAnnotations
+		k8s["k8s_pod_annotations"] = k8sService.PodAnnotations
 	}
 
 	return k8s
@@ -409,70 +460,80 @@ func (c *Component) addEBPFConfig(config map[string]interface{}) {
 	if c.args.EBPF.ProtocolDebug {
 		ebpf["protocol_debug"] = true
 	}
+	if c.args.EBPF.InstrumentCuda != 0 {
+		ebpf["instrument_cuda"] = c.args.EBPF.InstrumentCuda
+	}
+	if c.args.EBPF.MaxTransactionTime != 0 {
+		ebpf["max_transaction_time"] = c.args.EBPF.MaxTransactionTime.String()
+	}
+	if c.args.EBPF.DNSRequestTimeout != 0 {
+		ebpf["dns_request_timeout"] = c.args.EBPF.DNSRequestTimeout.String()
+	}
 
 	if len(ebpf) > 0 {
 		config["ebpf"] = ebpf
 	}
 }
 
-// addNetworkFlowsConfig adds network flows configuration
+// addNetworkConfig adds network configuration
 // Generates:
-//   network_flows:
-//     enable: true
-//     source: "auto"
-//     interfaces: ["eth0", "eth1"]
-//     cache_max_flows: 10000
-//     direction: "both"
-func (c *Component) addNetworkFlowsConfig(config map[string]interface{}) {
+//
+//	network:
+//	  enable: true
+//	  source: "auto"
+//	  interfaces: ["eth0", "eth1"]
+//	  cache_max_flows: 10000
+//	  direction: "both"
+func (c *Component) addNetworkConfig(config map[string]interface{}) {
 	if !c.args.Metrics.hasNetworkFeature() && !c.args.Metrics.Network.Enable {
 		return
 	}
 
-	networkFlows := map[string]interface{}{
+	network := map[string]interface{}{
 		"enable": true,
 	}
 
 	if c.args.Metrics.Network.Source != "" {
-		networkFlows["source"] = c.args.Metrics.Network.Source
+		network["source"] = c.args.Metrics.Network.Source
 	}
 	if c.args.Metrics.Network.AgentIP != "" {
-		networkFlows["agent_ip"] = c.args.Metrics.Network.AgentIP
+		network["agent_ip"] = c.args.Metrics.Network.AgentIP
 	}
 	if c.args.Metrics.Network.AgentIPIface != "" {
-		networkFlows["agent_ip_iface"] = c.args.Metrics.Network.AgentIPIface
+		network["agent_ip_iface"] = c.args.Metrics.Network.AgentIPIface
 	}
 	if c.args.Metrics.Network.AgentIPType != "" {
-		networkFlows["agent_ip_type"] = c.args.Metrics.Network.AgentIPType
+		network["agent_ip_type"] = c.args.Metrics.Network.AgentIPType
 	}
 	if len(c.args.Metrics.Network.Interfaces) > 0 {
-		networkFlows["interfaces"] = c.args.Metrics.Network.Interfaces
+		network["interfaces"] = c.args.Metrics.Network.Interfaces
 	}
 	if len(c.args.Metrics.Network.ExcludeInterfaces) > 0 {
-		networkFlows["exclude_interfaces"] = c.args.Metrics.Network.ExcludeInterfaces
+		network["exclude_interfaces"] = c.args.Metrics.Network.ExcludeInterfaces
 	}
 	if len(c.args.Metrics.Network.Protocols) > 0 {
-		networkFlows["protocols"] = c.args.Metrics.Network.Protocols
+		network["protocols"] = c.args.Metrics.Network.Protocols
 	}
 	if len(c.args.Metrics.Network.ExcludeProtocols) > 0 {
-		networkFlows["exclude_protocols"] = c.args.Metrics.Network.ExcludeProtocols
+		network["exclude_protocols"] = c.args.Metrics.Network.ExcludeProtocols
 	}
 	if c.args.Metrics.Network.CacheMaxFlows != 0 {
-		networkFlows["cache_max_flows"] = c.args.Metrics.Network.CacheMaxFlows
+		network["cache_max_flows"] = c.args.Metrics.Network.CacheMaxFlows
 	}
 	if c.args.Metrics.Network.CacheActiveTimeout != 0 {
-		networkFlows["cache_active_timeout"] = c.args.Metrics.Network.CacheActiveTimeout.String()
+		network["cache_active_timeout"] = c.args.Metrics.Network.CacheActiveTimeout.String()
 	}
 	if c.args.Metrics.Network.Direction != "" {
-		networkFlows["direction"] = c.args.Metrics.Network.Direction
+		network["direction"] = c.args.Metrics.Network.Direction
 	}
 	if c.args.Metrics.Network.Sampling != 0 {
-		networkFlows["sampling"] = c.args.Metrics.Network.Sampling
+		network["sampling"] = c.args.Metrics.Network.Sampling
 	}
 	if len(c.args.Metrics.Network.CIDRs) > 0 {
-		networkFlows["cidrs"] = c.args.Metrics.Network.CIDRs
+		network["cidrs"] = c.args.Metrics.Network.CIDRs
 	}
 
-	config["network_flows"] = networkFlows
+	config["network"] = network
 }
 
 // addFiltersConfig adds filters configuration
@@ -508,7 +569,7 @@ func (c *Component) addFiltersConfig(config map[string]interface{}) {
 	}
 
 	if len(filters) > 0 {
-		config["filters"] = filters
+		config["filter"] = filters
 	}
 }
 
@@ -604,5 +665,39 @@ func (c *Component) addTracePrinterConfig(config map[string]interface{}) {
 func (c *Component) addEnforceSysCapsConfig(config map[string]interface{}) {
 	if c.args.EnforceSysCaps {
 		config["enforce_sys_caps"] = true
+	}
+}
+
+// addTopLevelConfig adds miscellaneous top-level configuration fields.
+func (c *Component) addTopLevelConfig(config map[string]interface{}) {
+	if c.args.LogLevel != "" {
+		config["log_level"] = c.args.LogLevel
+	}
+	if c.args.ShutdownTimeout != 0 {
+		config["shutdown_timeout"] = c.args.ShutdownTimeout.String()
+	}
+
+	ja := c.args.JavaAgent
+	if ja.Enabled || ja.AttachTimeout != "" || ja.Debug || ja.DebugInstrumentation {
+		javaagent := map[string]interface{}{}
+		if ja.Enabled {
+			javaagent["enabled"] = true
+		}
+		if ja.AttachTimeout != "" {
+			javaagent["attach_timeout"] = ja.AttachTimeout
+		}
+		if ja.Debug {
+			javaagent["debug"] = true
+		}
+		if ja.DebugInstrumentation {
+			javaagent["debug_instrumentation"] = true
+		}
+		config["javaagent"] = javaagent
+	}
+
+	if c.args.NodeJS.Enabled {
+		config["nodejs"] = map[string]interface{}{
+			"enabled": true,
+		}
 	}
 }

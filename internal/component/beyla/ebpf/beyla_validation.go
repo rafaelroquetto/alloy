@@ -10,7 +10,7 @@ import (
 // isValidInstrumentation checks if an instrumentation type is valid
 func isValidInstrumentation(instrumentation string) bool {
 	switch instrumentation {
-	case "*", "http", "grpc", "redis", "kafka", "sql", "gpu", "mongo":
+	case "*", "http", "grpc", "redis", "kafka", "sql", "cuda", "mongo":
 		return true
 	default:
 		return false
@@ -133,6 +133,15 @@ func (args *Arguments) Validate() error {
 		}
 		if !validPrinters[args.TracePrinter] {
 			return fmt.Errorf("trace_printer: invalid value %q. Valid values are: disabled, counter, text, json, json_indent", args.TracePrinter)
+		}
+	}
+
+	if args.LogLevel != "" {
+		validLogLevels := map[string]bool{
+			"DEBUG": true, "INFO": true, "WARN": true, "ERROR": true,
+		}
+		if !validLogLevels[args.LogLevel] {
+			return fmt.Errorf("log_level: invalid value %q. Valid values are: DEBUG, INFO, WARN, ERROR", args.LogLevel)
 		}
 	}
 

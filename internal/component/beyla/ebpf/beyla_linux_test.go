@@ -337,8 +337,8 @@ func TestYAMLGeneration_NetworkFlows(t *testing.T) {
 	err = yaml.Unmarshal(data, &config)
 	require.NoError(t, err)
 
-	// Verify network_flows
-	networkFlows, ok := config["network_flows"].(map[string]interface{})
+	// Verify network
+	networkFlows, ok := config["network"].(map[string]interface{})
 	require.True(t, ok)
 	require.Equal(t, true, networkFlows["enable"])
 	require.Equal(t, "0.0.0.0", networkFlows["agent_ip"])

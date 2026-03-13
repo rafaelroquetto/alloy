@@ -12,18 +12,22 @@ type Arguments struct {
 	// Deprecated: Use discovery.services instead.
 	Port string `alloy:"open_port,attr,optional"`
 	// Deprecated: Use discovery.services instead.
-	ExecutableName string                     `alloy:"executable_name,attr,optional"`
-	Debug          bool                       `alloy:"debug,attr,optional"`
-	TracePrinter   string                     `alloy:"trace_printer,attr,optional"`
-	EnforceSysCaps bool                       `alloy:"enforce_sys_caps,attr,optional"`
-	Routes         Routes                     `alloy:"routes,block,optional"`
-	Attributes     Attributes                 `alloy:"attributes,block,optional"`
-	Discovery      Discovery                  `alloy:"discovery,block,optional"`
-	Metrics        Metrics                    `alloy:"metrics,block,optional"`
-	Traces         Traces                     `alloy:"traces,block,optional"`
-	EBPF           EBPF                       `alloy:"ebpf,block,optional"`
-	Filters        Filters                    `alloy:"filters,block,optional"`
-	Output         *otelcol.ConsumerArguments `alloy:"output,block,optional"`
+	ExecutableName  string                     `alloy:"executable_name,attr,optional"`
+	Debug           bool                       `alloy:"debug,attr,optional"`
+	TracePrinter    string                     `alloy:"trace_printer,attr,optional"`
+	EnforceSysCaps  bool                       `alloy:"enforce_sys_caps,attr,optional"`
+	LogLevel        string                     `alloy:"log_level,attr,optional"`
+	ShutdownTimeout time.Duration              `alloy:"shutdown_timeout,attr,optional"`
+	Routes          Routes                     `alloy:"routes,block,optional"`
+	Attributes      Attributes                 `alloy:"attributes,block,optional"`
+	Discovery       Discovery                  `alloy:"discovery,block,optional"`
+	Metrics         Metrics                    `alloy:"metrics,block,optional"`
+	Traces          Traces                     `alloy:"traces,block,optional"`
+	EBPF            EBPF                       `alloy:"ebpf,block,optional"`
+	Filters         Filters                    `alloy:"filters,block,optional"`
+	JavaAgent       JavaAgent                  `alloy:"javaagent,block,optional"`
+	NodeJS          NodeJS                     `alloy:"nodejs,block,optional"`
+	Output          *otelcol.ConsumerArguments `alloy:"output,block,optional"`
 }
 
 type Exports struct {
@@ -31,11 +35,12 @@ type Exports struct {
 }
 
 type Routes struct {
-	Unmatch        string   `alloy:"unmatched,attr,optional"`
-	Patterns       []string `alloy:"patterns,attr,optional"`
-	IgnorePatterns []string `alloy:"ignored_patterns,attr,optional"`
-	IgnoredEvents  string   `alloy:"ignore_mode,attr,optional"`
-	WildcardChar   string   `alloy:"wildcard_char,attr,optional"`
+	Unmatch                    string   `alloy:"unmatched,attr,optional"`
+	Patterns                   []string `alloy:"patterns,attr,optional"`
+	IgnorePatterns             []string `alloy:"ignored_patterns,attr,optional"`
+	IgnoredEvents              string   `alloy:"ignore_mode,attr,optional"`
+	WildcardChar               string   `alloy:"wildcard_char,attr,optional"`
+	MaxPathSegmentCardinality  int      `alloy:"max_path_segment_cardinality,attr,optional"`
 }
 
 type Attributes struct {
@@ -52,6 +57,9 @@ type KubernetesDecorator struct {
 	DisableInformers      []string      `alloy:"disable_informers,attr,optional"`
 	MetaRestrictLocalNode bool          `alloy:"meta_restrict_local_node,attr,optional"`
 	MetaCacheAddress      string        `alloy:"meta_cache_address,attr,optional"`
+	DropExternal          bool          `alloy:"drop_external,attr,optional"`
+	ResourceLabels        []string      `alloy:"resource_labels,attr,optional"`
+	ServiceNameTemplate   string        `alloy:"service_name_template,attr,optional"`
 }
 
 type InstanceIDConfig struct {
@@ -79,6 +87,8 @@ type Service struct {
 	Namespace      string            `alloy:"namespace,attr,optional"`
 	OpenPorts      string            `alloy:"open_ports,attr,optional"`
 	Path           string            `alloy:"exe_path,attr,optional"`
+	CmdArgs        string            `alloy:"cmd_args,attr,optional"`
+	Languages      []string          `alloy:"languages,attr,optional"`
 	Kubernetes     KubernetesService `alloy:"kubernetes,block,optional"`
 	ContainersOnly bool              `alloy:"containers_only,attr,optional"`
 	ExportModes    []string          `alloy:"exports,attr,optional"`
@@ -92,6 +102,9 @@ type KubernetesService struct {
 	ReplicaSetName  string            `alloy:"replicaset_name,attr,optional"`
 	StatefulSetName string            `alloy:"statefulset_name,attr,optional"`
 	DaemonSetName   string            `alloy:"daemonset_name,attr,optional"`
+	CronjobName     string            `alloy:"cronjob_name,attr,optional"`
+	JobName         string            `alloy:"job_name,attr,optional"`
+	ContainerName   string            `alloy:"container_name,attr,optional"`
 	OwnerName       string            `alloy:"owner_name,attr,optional"`
 	PodLabels       map[string]string `alloy:"pod_labels,attr,optional"`
 	PodAnnotations  map[string]string `alloy:"pod_annotations,attr,optional"`
@@ -100,7 +113,7 @@ type KubernetesService struct {
 type Discovery struct {
 	// Deprecated: Use discovery.instrument instead
 	Services Services `alloy:"services,block,optional"`
-	// Deprecated: Use discovery.exlcude_instrument instead
+	// Deprecated: Use discovery.exclude_instrument instead
 	ExcludeServices Services `alloy:"exclude_services,block,optional"`
 	// Deprecated: Use discovery.default_exclude_instrument instead
 	DefaultExcludeServices   Services `alloy:"default_exclude_services,block,optional"`
@@ -109,8 +122,15 @@ type Discovery struct {
 	ExcludeInstrument        Services `alloy:"exclude_instrument,block,optional"`
 	DefaultExcludeInstrument Services `alloy:"default_exclude_instrument,block,optional"`
 
-	SkipGoSpecificTracers           bool `alloy:"skip_go_specific_tracers,attr,optional"`
-	ExcludeOTelInstrumentedServices bool `alloy:"exclude_otel_instrumented_services,attr,optional"`
+	SkipGoSpecificTracers                        bool          `alloy:"skip_go_specific_tracers,attr,optional"`
+	ExcludeOTelInstrumentedServices              bool          `alloy:"exclude_otel_instrumented_services,attr,optional"`
+	ExcludeOTelInstrumentedServicesSpanMetrics   bool          `alloy:"exclude_otel_instrumented_services_span_metrics,attr,optional"`
+	MinProcessAge                                time.Duration `alloy:"min_process_age,attr,optional"`
+	PollInterval                                 time.Duration `alloy:"poll_interval,attr,optional"`
+	BpfPidFilterOff                              bool          `alloy:"bpf_pid_filter_off,attr,optional"`
+	RouteHarvesterTimeout                        time.Duration `alloy:"route_harvester_timeout,attr,optional"`
+	DisabledRouteHarvesters                      []string      `alloy:"disabled_route_harvesters,attr,optional"`
+	ExcludedLinuxSystemPaths                     []string      `alloy:"excluded_linux_system_paths,attr,optional"`
 }
 
 type Metrics struct {
@@ -154,11 +174,25 @@ type EBPF struct {
 	HeuristicSQLDetect  bool          `alloy:"heuristic_sql_detect,attr,optional"`
 	BpfDebug            bool          `alloy:"bpf_debug,attr,optional"`
 	ProtocolDebug       bool          `alloy:"protocol_debug_print,attr,optional"`
+	InstrumentCuda      int           `alloy:"instrument_cuda,attr,optional"`
+	MaxTransactionTime  time.Duration `alloy:"max_transaction_time,attr,optional"`
+	DNSRequestTimeout   time.Duration `alloy:"dns_request_timeout,attr,optional"`
 }
 
 type Filters struct {
 	Application AttributeFamilies `alloy:"application,block,optional"`
 	Network     AttributeFamilies `alloy:"network,block,optional"`
+}
+
+type JavaAgent struct {
+	Enabled              bool   `alloy:"enabled,attr,optional"`
+	AttachTimeout        string `alloy:"attach_timeout,attr,optional"`
+	Debug                bool   `alloy:"debug,attr,optional"`
+	DebugInstrumentation bool   `alloy:"debug_instrumentation,attr,optional"`
+}
+
+type NodeJS struct {
+	Enabled bool `alloy:"enabled,attr,optional"`
 }
 
 type AttributeFamilies []AttributeFamily
