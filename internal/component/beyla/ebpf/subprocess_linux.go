@@ -184,6 +184,14 @@ func (c *Component) runSubprocess(ctx context.Context) error {
 		return fmt.Errorf("failed to start subprocess: %w", startErr)
 	}
 
+	// Child has exec'd and holds its own reference to the memfd inode; close ours now.
+	c.mut.Lock()
+	if c.beylaExeClose != nil {
+		c.beylaExeClose()
+		c.beylaExeClose = nil
+	}
+	c.mut.Unlock()
+
 	level.Info(c.opts.Logger).Log("msg", "Beyla subprocess started", "pid", cmd.Process.Pid, "binary_size", len(beylaEmbeddedBinary))
 
 	err = cmd.Wait()

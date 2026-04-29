@@ -50,6 +50,7 @@ type Component struct {
 	subprocessAddr string    // Full address (http://localhost:PORT)
 	subprocessCmd  *exec.Cmd // The running subprocess
 	beylaExePath   string    // Path to extracted Beyla binary
+	beylaExeClose  func()    // Closes the memfd; called early after exec, cleanup is fallback
 	configPath     string    // Path to config file
 	cleanupFuncs   []func()  // Cleanup functions for temp files
 
@@ -274,7 +275,7 @@ func (c *Component) setupSubprocess(restartTimer *time.Timer) error {
 
 	c.mut.Lock()
 	c.beylaExePath = exePath
-	c.cleanupFuncs = append(c.cleanupFuncs, cleanupBinary)
+	c.beylaExeClose = cleanupBinary
 	c.mut.Unlock()
 
 	if err := c.startOTLPReceiver(); err != nil {
@@ -439,6 +440,10 @@ func (c *Component) cleanup() {
 	c.mut.Lock()
 	defer c.mut.Unlock()
 
+	if c.beylaExeClose != nil {
+		c.beylaExeClose()
+		c.beylaExeClose = nil
+	}
 	for _, cleanupFunc := range c.cleanupFuncs {
 		cleanupFunc()
 	}
