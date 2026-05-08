@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path"
+	"strings"
 	"sync"
 	"time"
 
@@ -46,13 +47,14 @@ type Component struct {
 	argsUpdate chan Arguments
 
 	// Subprocess-specific fields
-	subprocessPort int       // Port where Beyla subprocess listens
-	subprocessAddr string    // Full address (http://localhost:PORT)
-	subprocessCmd  *exec.Cmd // The running subprocess
-	beylaExePath   string    // Path to extracted Beyla binary
-	beylaExeClose  func()    // Closes the memfd; called early after exec, cleanup is fallback
-	configPath     string    // Path to config file
-	cleanupFuncs   []func()  // Cleanup functions for temp files
+	subprocessPort        int       // Port where Beyla subprocess listens
+	subprocessAddr        string    // Full address (http://localhost:PORT)
+	subprocessProfilePort int       // Beyla pprof port; 0 when pprof is disabled in Alloy
+	subprocessCmd         *exec.Cmd // The running subprocess
+	beylaExePath          string    // Path to extracted Beyla binary
+	beylaExeClose         func()    // Closes the memfd; called early after exec, cleanup is fallback
+	configPath            string    // Path to config file
+	cleanupFuncs          []func()  // Cleanup functions for temp files
 
 	// OTLP receiver for traces and metrics (when Output is configured)
 	otlpReceiverPort int          // Port where OTLP receiver listens for signals from Beyla
@@ -307,6 +309,14 @@ func (c *Component) setupSubprocess(restartTimer *time.Timer) error {
 	c.subprocessAddr = fmt.Sprintf("http://127.0.0.1:%d", port)
 	c.mut.Unlock()
 
+	if err := c.allocateProfilePort(); err != nil {
+		level.Error(c.opts.Logger).Log("msg", "failed to allocate Beyla profile port", "err", err)
+		c.reportUnhealthy(err)
+		c.cleanup()
+		c.scheduleRestart(restartTimer)
+		return err
+	}
+
 	configPath, cleanupConfig, err := c.writeConfigFile()
 	if err != nil {
 		level.Error(c.opts.Logger).Log("msg", "failed to write config", "err", err)
@@ -321,6 +331,24 @@ func (c *Component) setupSubprocess(restartTimer *time.Timer) error {
 	c.cleanupFuncs = append(c.cleanupFuncs, cleanupConfig)
 	c.mut.Unlock()
 
+	return nil
+}
+
+func (c *Component) allocateProfilePort() error {
+	data, err := c.opts.GetServiceData(http_service.ServiceName)
+	if err != nil {
+		return fmt.Errorf("failed to get HTTP service data: %w", err)
+	}
+	if !data.(http_service.Data).EnablePProf {
+		return nil
+	}
+	port, err := findFreePort()
+	if err != nil {
+		return err
+	}
+	c.mut.Lock()
+	c.subprocessProfilePort = port
+	c.mut.Unlock()
 	return nil
 }
 
@@ -397,6 +425,7 @@ func (c *Component) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		c.mut.Lock()
 		addr := c.subprocessAddr
+		profilePort := c.subprocessProfilePort
 		ready := c.subprocessReady
 		c.mut.Unlock()
 
@@ -405,7 +434,16 @@ func (c *Component) Handler() http.Handler {
 			return
 		}
 
-		target, err := url.Parse(addr)
+		targetAddr := addr
+		if strings.HasPrefix(r.URL.Path, "/debug/pprof") {
+			if profilePort == 0 {
+				http.NotFound(w, r)
+				return
+			}
+			targetAddr = fmt.Sprintf("http://127.0.0.1:%d", profilePort)
+		}
+
+		target, err := url.Parse(targetAddr)
 		if err != nil {
 			level.Error(c.opts.Logger).Log("msg", "failed to parse subprocess URL", "err", err)
 			http.Error(w, "internal error", http.StatusInternalServerError)
@@ -458,5 +496,6 @@ func (c *Component) cleanup() {
 	c.beylaExePath = ""
 	c.configPath = ""
 	c.otlpReceiverPort = 0
+	c.subprocessProfilePort = 0
 	c.subprocessReady = false
 }

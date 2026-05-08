@@ -954,7 +954,15 @@ Profile data for the Beyla subprocess is exposed by Beyla on its own HTTP port a
 <alloy>/api/v0/component/beyla.ebpf.<LABEL>/debug/pprof/heap
 ```
 
-Continuous profiling pipelines that previously scraped {{< param "PRODUCT_NAME" >}}'s pprof endpoints to capture Beyla's contribution must now also scrape the component's proxied pprof URL.
+The Beyla subprocess only exposes pprof endpoints when {{< param "PRODUCT_NAME" >}} itself has profiling enabled.
+The toggle is the existing `--server.http.enable-pprof` flag (default `true`); when set to `false`, the proxied URL above also returns 404 — matching {{< param "PRODUCT_NAME" >}}'s own behaviour.
+There is no separate Beyla-specific switch.
+
+Each `beyla.ebpf` component instance has its own pprof URL scoped by component ID.
+With multiple instances configured (`beyla.ebpf.foo`, `beyla.ebpf.bar`, ...), each is reachable at its own component path with no extra wiring.
+
+Continuous-profiling pipelines that previously scraped {{< param "PRODUCT_NAME" >}}'s pprof endpoints to capture Beyla's contribution must now also scrape the component's proxied pprof URL.
+The existing scrape job continues to work but only captures {{< param "PRODUCT_NAME" >}}'s own profile.
 
 ## Examples
 

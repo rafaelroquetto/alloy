@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"os"
 	"os/exec"
 	"runtime"
 	"strings"
@@ -136,6 +137,7 @@ func (c *Component) runSubprocess(ctx context.Context) error {
 	exePath := c.beylaExePath
 	configPath := c.configPath
 	port := c.subprocessPort
+	profilePort := c.subprocessProfilePort
 	c.mut.Unlock()
 
 	if exePath == "" {
@@ -150,6 +152,11 @@ func (c *Component) runSubprocess(ctx context.Context) error {
 	// Ensure Beyla subprocess gets killed when Alloy dies (even with SIGKILL).
 	cmd.SysProcAttr = &syscall.SysProcAttr{
 		Pdeathsig: syscall.SIGKILL,
+	}
+
+	cmd.Env = os.Environ()
+	if profilePort != 0 {
+		cmd.Env = append(cmd.Env, fmt.Sprintf("BEYLA_PROFILE_PORT=%d", profilePort))
 	}
 
 	cmd.Stdout = &logWriter{logger: c.opts.Logger, level: "info"}
