@@ -923,6 +923,39 @@ The exported targets use the configured [in-memory traffic][] address specified 
 
 `beyla.ebpf` doesn't expose any component-specific debug information.
 
+## Observability considerations
+
+`beyla.ebpf` runs Beyla as a separate subprocess. This isolates Beyla's failures from {{< param "PRODUCT_NAME" >}} but changes how its resource usage and profile data are exposed.
+
+### Resource metrics
+
+{{< param "PRODUCT_NAME" >}} exposes process-level metrics for the Beyla subprocess under the same name as its own, distinguished by a `subprocess="beyla"` label:
+
+```promql
+alloy_resources_process_resident_memory_bytes                    # {{< param "PRODUCT_NAME" >}} process only
+alloy_resources_process_resident_memory_bytes{subprocess="beyla"} # Beyla subprocess only
+```
+
+Dashboards or alerts that previously used `alloy_resources_process_*` to approximate total container resource usage will now see only {{< param "PRODUCT_NAME" >}}'s share.
+To get the combined figure for both processes, sum across the label:
+
+```promql
+sum without(subprocess) (alloy_resources_process_resident_memory_bytes)
+```
+
+For container-level limits and OOM monitoring, prefer kubelet/cAdvisor metrics such as `container_memory_working_set_bytes`, which already account for every process in the container.
+
+### Profiling
+
+{{< param "PRODUCT_NAME" >}}'s `/debug/pprof/*` endpoints reflect only {{< param "PRODUCT_NAME" >}}'s own goroutines, allocations, and CPU.
+Profile data for the Beyla subprocess is exposed by Beyla on its own HTTP port and is reachable through the component's reverse-proxy URL, for example:
+
+```
+<alloy>/api/v0/component/beyla.ebpf.<LABEL>/debug/pprof/heap
+```
+
+Continuous profiling pipelines that previously scraped {{< param "PRODUCT_NAME" >}}'s pprof endpoints to capture Beyla's contribution must now also scrape the component's proxied pprof URL.
+
 ## Examples
 
 The following examples show you how to collect metrics and traces from `beyla.ebpf`.
