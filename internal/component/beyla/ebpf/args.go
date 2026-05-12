@@ -122,6 +122,8 @@ type Network struct {
 	Direction          string        `alloy:"direction,attr,optional"`
 	Sampling           int           `alloy:"sampling,attr,optional"`
 	CIDRs              []string      `alloy:"cidrs,attr,optional"`
+	Deduper            string        `alloy:"deduper,attr,optional"`
+	DeduperFCTTL       time.Duration `alloy:"deduper_fc_ttl,attr,optional"`
 }
 
 type OpenAIPayloadExtraction struct {

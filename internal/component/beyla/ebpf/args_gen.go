@@ -37,6 +37,7 @@ type EBPFBufferSizes struct {
 	Mssql    int `alloy:"mssql,attr,optional"`
 	Mysql    int `alloy:"mysql,attr,optional"`
 	Postgres int `alloy:"postgres,attr,optional"`
+	Tcp      int `alloy:"tcp,attr,optional"`
 }
 
 type LogEnricherConfig struct {
@@ -164,12 +165,18 @@ type SamplerConfig struct {
 	Name string `alloy:"name,attr,optional"`
 }
 
+type Quantity struct {
+	Format string `alloy:"Format,attr,optional"`
+}
+
 type InjectorWebhook struct {
-	CertPath string         `alloy:"cert_path,attr,optional"`
-	Enable   bool           `alloy:"enable,attr,optional"`
-	KeyPath  string         `alloy:"key_path,attr,optional"`
-	Port     *int           `alloy:"port,attr,optional"`
-	Timeout  *time.Duration `alloy:"timeout,attr,optional"`
+	CertPath              string         `alloy:"cert_path,attr,optional"`
+	Enable                bool           `alloy:"enable,attr,optional"`
+	KeyPath               string         `alloy:"key_path,attr,optional"`
+	MaxAdmissionBodySize  Quantity       `alloy:"max_admission_body_size,block,optional"`
+	MaxConcurrentRequests int            `alloy:"max_concurrent_requests,attr,optional"`
+	Port                  *int           `alloy:"port,attr,optional"`
+	Timeout               *time.Duration `alloy:"timeout,attr,optional"`
 }
 
 type Injector struct {

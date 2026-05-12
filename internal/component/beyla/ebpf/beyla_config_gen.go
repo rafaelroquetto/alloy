@@ -104,6 +104,9 @@ func (c *Component) addEbpfConfig(config map[string]interface{}) {
 		if v := c.args.EBPF.BufferSizes.Postgres; v != 0 {
 			m1["postgres"] = v
 		}
+		if v := c.args.EBPF.BufferSizes.Tcp; v != 0 {
+			m1["tcp"] = v
+		}
 		if len(m1) > 0 {
 			m["buffer_sizes"] = m1
 		}
@@ -431,6 +434,18 @@ func (c *Component) addInjectorConfig(config map[string]interface{}) {
 		if v := c.args.Injector.Webhook.KeyPath; v != "" {
 			m1["key_path"] = v
 		}
+		{
+			m2 := make(map[string]interface{})
+			if v := c.args.Injector.Webhook.MaxAdmissionBodySize.Format; v != "" {
+				m2["Format"] = v
+			}
+			if len(m2) > 0 {
+				m1["max_admission_body_size"] = m2
+			}
+		}
+		if v := c.args.Injector.Webhook.MaxConcurrentRequests; v != 0 {
+			m1["max_concurrent_requests"] = v
+		}
 		if v := c.args.Injector.Webhook.Port; v != nil {
 			m1["port"] = *v
 		}
@@ -604,6 +619,12 @@ func (c *Component) fillNetworkConfig(m map[string]interface{}) {
 	}
 	if v := c.args.Metrics.Network.CIDRs; len(v) > 0 {
 		m["cidrs"] = v
+	}
+	if v := c.args.Metrics.Network.Deduper; v != "" {
+		m["deduper"] = v
+	}
+	if v := c.args.Metrics.Network.DeduperFCTTL; v != 0 {
+		m["deduper_fc_ttl"] = v.String()
 	}
 	if v := c.args.Metrics.Network.Direction; v != "" {
 		m["direction"] = v
